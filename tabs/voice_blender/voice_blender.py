@@ -18,7 +18,9 @@ def update_model_fusion(dropbox):
 def voice_blender_tab():
     def _blend_with_toast(*args):
         if not all(str(model).lower().endswith(".pth") for model in args[1:3]):
-            message = i18n("Blending requires .pth voice models; ONNX files are not supported.")
+            message = i18n(
+                "Blending requires .pth voice models; ONNX files are not supported."
+            )
             gr.Warning(message)
             return message, None
         gr.Info(i18n("Blending models..."))

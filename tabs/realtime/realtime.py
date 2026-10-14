@@ -1588,7 +1588,6 @@ def realtime_tab():
         def update_visibility(checkbox, count):
             return [gr.update(visible=checkbox) for _ in range(count)]
 
-
         def formant_visible(checkbox):
             return update_visibility(checkbox, 2)
 
@@ -1597,7 +1596,6 @@ def realtime_tab():
             inputs=[formant_shifting],
             outputs=[formant_qfrency, formant_timbre],
         )
-
 
         if client_mode:
 
@@ -2244,4 +2242,3 @@ def realtime_tab():
             inputs=[formant_timbre],
             outputs=[],
         )
-

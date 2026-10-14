@@ -168,11 +168,7 @@ with gr.Blocks(
     ),
 ) as Applio:
     gr.HTML(brand_header())
-    gr.Markdown(
-        i18n(
-            ECOSYSTEM["brand"]["description"]
-        )
-    )
+    gr.Markdown(i18n(ECOSYSTEM["brand"]["description"]))
     gr.Markdown(resource_markdown(i18n))
     with gr.Tab(i18n("Inference")):
         gr.Markdown(guide_markdown("inference", i18n))

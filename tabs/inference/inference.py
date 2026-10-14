@@ -1279,7 +1279,6 @@ def inference_tab():
                 gr.update(visible=False),
             )
 
-
     autotune.change(
         fn=toggle_visible,
         inputs=[autotune],
