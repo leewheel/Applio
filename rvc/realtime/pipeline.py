@@ -1,22 +1,29 @@
 import os
 import sys
-import faiss
+import types
 import numpy as np
 import torch
 import torch.nn.utils.parametrize
 import torch.nn.functional as F
-import torchaudio.transforms as tat
 from torch import Tensor
+import torchcrepe
 
 now_dir = os.getcwd()
 sys.path.append(now_dir)
 
-from rvc.realtime.utils.torch import circular_write
-from rvc.configs.config import Config
-from rvc.infer.pipeline import Autotune, AudioProcessor
+
+class CudaGraphCaptureError(RuntimeError):
+    """The service must restart before it can safely use eager CUDA inference."""
+
+
+from rvc.realtime.utils.torch import circular_write, AudioProcessorTorch, IndexWrapper
+from rvc.realtime.utils.fcpe import RealtimeMel, local_decoder
+from rvc.configs.config import inference_config
+from rvc.infer.pipeline import Autotune
 from rvc.lib.algorithm.synthesizers import Synthesizer
-from rvc.lib.predictors.f0 import FCPE, RMVPE
+from rvc.lib.predictors.f0 import FCPE, RMVPE, SWIFT
 from rvc.lib.utils import load_embedding, HubertModelWithFinalProj
+from rvc.realtime.precision import enable_experimental_tf32
 
 
 class RealtimeVoiceConverter:
@@ -24,11 +31,14 @@ class RealtimeVoiceConverter:
     A class for performing realtime voice conversion using the Retrieval-Based Voice Conversion (RVC) method.
     """
 
-    def __init__(self, weight_root):
+    def __init__(self, weight_root, device=None):
         """
         Initializes the RealtimeVoiceConverter with default configuration, and sets up models and parameters.
         """
-        self.config = Config()  # Load configuration
+        self.config = inference_config()
+        if device is not None:
+            self.config.device = device
+        enable_experimental_tf32(self.config.device, self.config.gpu_name)
         self.tgt_sr = None  # Target sampling rate for the output audio
         self.net_g = None  # Generator network for voice conversion
         self.cpt = None  # Checkpoint for loading model weights
@@ -36,6 +46,8 @@ class RealtimeVoiceConverter:
         self.use_f0 = None  # Whether the model uses F0
         # Change this when you need to test FP16, and it may not be faster.
         self.dtype = torch.float32  # torch.float16 if config.is_half else torch.float32
+        self.decoder_fp16 = False
+        self.onnx_decoder = False
         # load weights and setup model network.
         self.load_model(weight_root)
         self.setup_network()
@@ -47,11 +59,24 @@ class RealtimeVoiceConverter:
         Args:
             weight_root (str): Path to the model weights.
         """
+        self.model_path = weight_root
+        self.model_checksum = None
+        if os.environ.get("APPLIO_EXPERIMENTAL_ONNX_DECODER") and os.path.isfile(
+            weight_root
+        ):
+            from rvc.realtime.onnx_decoder import checkpoint_hash
+
+            self.model_checksum = checkpoint_hash(weight_root)
         self.cpt = (
             torch.load(weight_root, map_location="cpu", weights_only=True)
             if os.path.isfile(weight_root)
             else None
         )
+        if (
+            self.model_checksum is not None
+            and checkpoint_hash(weight_root) != self.model_checksum
+        ):
+            raise ValueError("Voice checkpoint changed while loading; retry")
 
     def setup_network(self):
         """
@@ -76,7 +101,28 @@ class RealtimeVoiceConverter:
             strip_parametrizations(self.net_g)
             self.net_g = self.net_g.to(self.config.device).to(self.dtype)
             self.net_g.eval()
-            # self.net_g.remove_weight_norm()
+            # The network owns its weights now; retaining the CPU checkpoint
+            # duplicates the model even when inference runs on an accelerator.
+            self.cpt = None
+            onnx_path = os.environ.get("APPLIO_EXPERIMENTAL_ONNX_DECODER")
+            self.onnx_decoder = bool(onnx_path)
+            if onnx_path:
+                from rvc.realtime.onnx_decoder import OnnxDecoder, resolve_decoder_path
+
+                onnx_path = resolve_decoder_path(
+                    self.net_g.dec,
+                    self.model_path,
+                    onnx_path,
+                    self.config.device,
+                    expected_checkpoint_hash=self.model_checksum,
+                )
+                self.net_g.dec = OnnxDecoder(
+                    self.net_g.dec,
+                    self.model_path,
+                    onnx_path,
+                    self.config.device,
+                    expected_checkpoint_hash=self.model_checksum,
+                )
 
     def inference(
         self,
@@ -86,8 +132,18 @@ class RealtimeVoiceConverter:
         pitch: Tensor,
         pitchf: Tensor,
         rate: Tensor = None,
+        skip_head: int = None,
     ):
-        output = self.net_g.infer(feats, p_len, pitch, pitchf, sid, rate)[0][0, 0]
+        output = self.net_g.infer(
+            feats,
+            p_len,
+            pitch,
+            pitchf,
+            sid,
+            rate,
+            skip_head,
+            decoder_fp16=self.decoder_fp16,
+        )[0][0, 0]
 
         return torch.clip(output, -1.0, 1.0, out=output)
 
@@ -98,40 +154,115 @@ class Realtime_Pipeline:
         vc: RealtimeVoiceConverter,
         hubert_model: HubertModelWithFinalProj = None,
         index=None,
-        big_npy=None,
+        big_tsr=None,
         f0_method: str = "rmvpe",
         sid: int = 0,
     ):
         self.vc = vc
         self.hubert_model = hubert_model
         self.index = index
-        self.big_npy = big_npy
+        self.big_tsr = big_tsr
         self.use_f0 = vc.use_f0
         self.version = vc.version
         self.f0_method = f0_method
         self.sample_rate = 16000
         self.tgt_sr = vc.tgt_sr
         self.window = 160
-        self.model_window = self.tgt_sr // 100
         self.f0_min = 50.0
         self.f0_max = 1100.0
         self.device = vc.config.device
         self.sid = sid
         self.torch_sid = torch.tensor([sid], device=self.device, dtype=torch.int64)
         self.autotune = Autotune()
+        self.autotune_notes = torch.tensor(
+            self.autotune.note_dict, dtype=vc.dtype, device=self.device
+        )
         self.resamplers = {}
         self.f0_model = self.setup_f0(self.f0_method)
         self.dtype = vc.dtype
         # Reuse scalar tensors to avoid per-block allocations.
-        self._rate_tensor = torch.zeros(1, device=self.device, dtype=torch.float32)
         self._p_len_tensor = torch.zeros(1, device=self.device, dtype=torch.int64)
+        self._graph_cache = None
+        self._graph_failed = False
+        gpu_name = (vc.config.gpu_name or "").upper()
+        # Local opt-in experiment: preserve FP32 retrieval/synthesis features
+        # while autocasting the large HuBERT network on NVIDIA CUDA.
+        self.embedder_fp16 = (
+            os.environ.get("APPLIO_EXPERIMENTAL_HUBERT_FP16") == "1"
+            and str(self.device).startswith("cuda")
+            and "NVIDIA" in gpu_name
+            and getattr(torch.version, "hip", None) is None
+        )
+        if self.embedder_fp16:
+            print("[Experimental] HuBERT FP16 autocast enabled for realtime.")
+        self._graph_supported = (
+            (
+                not getattr(vc, "onnx_decoder", False)
+                or getattr(vc.net_g.dec, "cuda_device", None) is not None
+            )
+            and str(self.device).startswith("cuda")
+            and "NVIDIA" in gpu_name
+            and not getattr(torch.version, "hip", None)
+            and "ZLUDA" not in gpu_name
+            and os.environ.get("APPLIO_DISABLE_CUDA_GRAPHS") != "1"
+            # Opt in only for services whose supervisor can recover by
+            # replacing the process after an invalid CUDA capture.
+            and os.environ.get("APPLIO_ENABLE_CUDA_GRAPHS") == "1"
+        )
+
+    def autotune_f0(self, f0, f0_autotune_strength):
+        notes = self.autotune_notes
+        nearest = notes[(f0[:, None] - notes[None, :]).abs().argmin(dim=1)]
+        # Unvoiced frames must stay unvoiced, including inside a CUDA graph.
+        return torch.where(f0 > 0, f0 + (nearest - f0) * f0_autotune_strength, f0)
 
     def setup_f0(self, f0_method: str = "fcpe"):
+        if not self.use_f0:
+            return None
         if f0_method == "rmvpe":
+
+            def _infer_from_audio(self, audio, thred=0.03):
+                mel = self.mel_extractor(audio.unsqueeze(0), center=True)
+                hidden = self.mel2hidden(mel)
+                hidden = hidden.squeeze(0)
+                f0 = self.decode(hidden, thred=thred)
+                return f0
+
+            def _to_local_average_cents(self, salience, thred=0.05):
+                center = torch.argmax(salience, dim=1)
+                salience = torch.nn.functional.pad(salience, (4, 4))
+                center += 4
+                offsets = torch.arange(-4, 5, device=salience.device)
+                idx = center[:, None] + offsets[None, :]
+                local_salience = salience[
+                    torch.arange(salience.shape[0], device=salience.device)[:, None],
+                    idx,
+                ]
+                product_sum = (local_salience * self.cents_mapping[idx]).sum(dim=1)
+                weight_sum = local_salience.sum(dim=1)
+                devided = product_sum / weight_sum
+                maxx = salience.max(dim=1).values
+                devided = torch.where(maxx <= thred, torch.zeros_like(devided), devided)
+                return devided
+
             f0_model = RMVPE(
                 device=self.device,
                 sample_rate=self.sample_rate,
                 hop_size=self.window,
+                # The high-register corrector is an offline two-pass method
+                # (numpy/librosa) and this path swaps infer_from_audio for a
+                # tensor-based variant, so it stays disabled here.
+                high_register={"enabled": False},
+            )
+
+            f0_model.model.cents_mapping = (
+                torch.from_numpy(f0_model.model.cents_mapping).float().to(self.device)
+            )
+            f0_model.model.infer_from_audio = types.MethodType(
+                _infer_from_audio, f0_model.model
+            )
+            f0_model.model.to_local_average_cents = types.MethodType(
+                _to_local_average_cents, f0_model.model
             )
         elif f0_method == "fcpe":
             f0_model = FCPE(
@@ -139,6 +270,23 @@ class Realtime_Pipeline:
                 sample_rate=self.sample_rate,
                 hop_size=self.window,
             )
+            if self.device != "mps":
+                f0_model.model.wav2mel.mel_extractor = RealtimeMel(
+                    f0_model.model.wav2mel.mel_extractor
+                )
+            f0_model.model.model.latent2cents_local_decoder = types.MethodType(
+                local_decoder, f0_model.model.model
+            )
+            strip_parametrizations(f0_model.model)
+        elif f0_method in ("swift", "swiftf0", "swift-f0"):
+            f0_model = SWIFT(
+                device=self.device,
+                sample_rate=self.sample_rate,
+                hop_size=self.window,
+            )
+        elif self.f0_method == "crepe":
+            f0_model = None
+
         return f0_model
 
     def get_f0(
@@ -156,27 +304,59 @@ class Realtime_Pipeline:
         Estimates the fundamental frequency (F0) of a given audio signal using various methods.
         """
 
-        if torch.is_tensor(x):
-            # If the input is a tensor, it will need to be converted to numpy array to calculate with RMVPE and FCPE.
-            x = x.cpu().numpy()
-
         if self.f0_method == "rmvpe":
             f0 = self.f0_model.get_f0(x, filter_radius=0.03)
         elif self.f0_method == "fcpe":
-            f0 = self.f0_model.get_f0(x, x.shape[0] // self.window, filter_radius=0.006)
+            f0 = self.f0_model.model.infer(
+                x.float().to(self.device).unsqueeze(0),
+                sr=self.f0_model.sample_rate,
+                decoder_mode="local_argmax",
+                threshold=0.006,
+            ).squeeze()
+        elif self.f0_method in ("swift", "swiftf0", "swift-f0"):
+            p_len = x.shape[0] // self.window
+            f0 = self.f0_model.get_f0(
+                x,
+                p_len=p_len,
+                f0_min=self.f0_min,
+                f0_max=self.f0_max,
+                filter_radius=0.5,
+            )
+            f0 = torch.from_numpy(f0).float().to(self.device)
+        elif self.f0_method == "crepe":
+            f0, pd = torchcrepe.predict(
+                x.float()
+                .to("cpu" if self.device == "mps" else self.device)
+                .unsqueeze(dim=0),
+                self.sample_rate,
+                self.window,
+                self.f0_min,
+                self.f0_max,
+                model="full",
+                batch_size=512,
+                device="cpu" if self.device == "mps" else self.device,
+                return_periodicity=True,
+            )
+            pd = torchcrepe.filter.median(pd, 3)
+            f0 = torchcrepe.filter.mean(f0, 3)
+            f0[pd < 0.1] = 0
+            f0 = f0[0]
+
+        f0 = torch.as_tensor(f0, dtype=torch.float32, device=self.device)
         # f0 adjustments
         if f0_autotune is True:
-            f0 = self.autotune.autotune_f0(f0, f0_autotune_strength)
+            f0 = self.autotune_f0(f0, f0_autotune_strength)
         elif proposed_pitch is True:
             limit = 12
+            _f0 = f0.cpu().numpy().copy()
             # calculate median f0 of the audio
-            valid_f0 = np.where(f0 > 0)[0]
+            valid_f0 = np.where(_f0 > 0)[0]
             if len(valid_f0) < 2:
                 # no valid f0 detected
                 up_key = 0
             else:
                 median_f0 = float(
-                    np.median(np.interp(np.arange(len(f0)), valid_f0, f0[valid_f0]))
+                    np.median(np.interp(np.arange(len(_f0)), valid_f0, _f0[valid_f0]))
                 )
                 if median_f0 <= 0 or np.isnan(median_f0):
                     up_key = 0
@@ -196,12 +376,12 @@ class Realtime_Pipeline:
             print(
                 "calculated pitch offset:", up_key
             )  # Might need to hide so terminal output doesn't become a mess
-            f0 *= pow(2, (f0_up_key + up_key) / 12)
+            f0 *= 2 ** ((f0_up_key + up_key) / 12)
         else:
-            f0 *= pow(2, f0_up_key / 12)
+            f0 *= 2 ** (f0_up_key / 12)
 
         # Convert to Tensor for computational use
-        f0 = torch.from_numpy(f0).to(self.device).float()
+        # f0 = torch.from_numpy(f0).to(self.device).float()
 
         # quantizing f0 to 255 buckets to make coarse f0
         f0_mel = 1127.0 * torch.log(1.0 + f0 / 700.0)
@@ -225,7 +405,7 @@ class Realtime_Pipeline:
 
         return pitch.unsqueeze(0), pitchf.unsqueeze(0)
 
-    def voice_conversion(
+    def _voice_conversion(
         self,
         audio: Tensor,
         pitch: Tensor = None,
@@ -243,8 +423,8 @@ class Realtime_Pipeline:
         proposed_pitch: bool = False,
         proposed_pitch_threshold: float = 155.0,
         reduced_noise=None,
-        board=None,
         block_size_16k: int = None,
+        return_decoder_inputs: bool = False,
     ):
         """
         Performs realtime voice conversion on a given audio segment.
@@ -265,6 +445,11 @@ class Realtime_Pipeline:
                 )
                 if self.f0_method == "rmvpe":
                     f0_frame = 5120 * ((f0_frame - 1) // 5120 + 1) - 160
+                elif self.f0_method == "fcpe":
+                    # Chunk duration should control latency, not pitch quality.
+                    # Keep the default 250ms block's 300ms analysis history even
+                    # when streaming much smaller blocks; no lookahead is added.
+                    f0_frame = max(f0_frame, 4800)
                 f0_frame = min(f0_frame, audio.shape[0])
 
                 f0_coarse_new, f0_new = self.get_f0(
@@ -295,7 +480,11 @@ class Realtime_Pipeline:
                 pitch, pitchf = None, None
 
             # extract features
-            feats = self.hubert_model(feats)["last_hidden_state"]
+            with torch.autocast(
+                "cuda", dtype=torch.float16, enabled=self.embedder_fp16
+            ):
+                feats = self.hubert_model(feats)["last_hidden_state"]
+            feats = feats.to(self.dtype)
             feats = (
                 self.hubert_model.final_proj(feats[0]).unsqueeze(0)
                 if self.version == "v1"
@@ -304,18 +493,18 @@ class Realtime_Pipeline:
 
             feats = torch.cat((feats, feats[:, -1:, :]), 1)
             # make a copy for pitch guidance and protection
-            feats0 = feats.detach().clone() if self.use_f0 else None
+            feats0 = feats.detach().clone() if self.use_f0 and protect < 0.5 else None
 
             try:
                 if (
-                    self.index and index_rate > 0
+                    self.index and self.big_tsr is not None and index_rate > 0
                 ):  # set by parent function, only true if index is available, loaded, and index rate > 0
                     feats = self._retrieve_speaker_embeddings(
-                        skip_head, feats, self.index, self.big_npy, index_rate
+                        skip_head, feats, self.index, self.big_tsr, index_rate
                     )
             except AssertionError:
                 print("The index file structure is incompatible with the model.")
-                self.index = self.big_npy = None
+                self.index = self.big_tsr = None
 
             # feature upsampling
             feats = F.interpolate(feats.permute(0, 2, 1), scale_factor=2).permute(
@@ -323,9 +512,10 @@ class Realtime_Pipeline:
             )[:, :p_len, :]
 
             if self.use_f0:
-                feats0 = F.interpolate(feats0.permute(0, 2, 1), scale_factor=2).permute(
-                    0, 2, 1
-                )[:, :p_len, :]
+                if feats0 is not None:
+                    feats0 = F.interpolate(
+                        feats0.permute(0, 2, 1), scale_factor=2
+                    ).permute(0, 2, 1)[:, :p_len, :]
                 pitch_p = pitch[-p_len:].unsqueeze(0)
                 pitchf_p = pitchf[-p_len:].unsqueeze(0) * (
                     formant_length / return_length
@@ -345,83 +535,187 @@ class Realtime_Pipeline:
 
             pitchf_p = pitchf_p.to(self.dtype) if self.use_f0 else None
             # Trim oldest context so model output covers only the current block.
-            self._rate_tensor.fill_(return_length / p_len)
+            # Match the legacy float32 rate rounding without a GPU .item()
+            # synchronization inside the synthesizer.
+            head = int(
+                feats.shape[1] * (1.0 - float(np.float32(return_length / p_len)))
+            )
             self._p_len_tensor.fill_(p_len)
+            if return_decoder_inputs:
+                latent, f0, speaker = self.vc.net_g.infer_latent(
+                    feats,
+                    self._p_len_tensor,
+                    pitch_p,
+                    pitchf_p,
+                    self.torch_sid,
+                    None,
+                    head,
+                )[:3]
+                decoder = self.vc.net_g.dec
+                # Preserve the regular decoder's excitation precision policy.
+                with torch.autocast(
+                    "cuda", dtype=torch.float16, enabled=self.vc.decoder_fp16
+                ):
+                    source = decoder.source(f0, decoder.upp)[0].transpose(1, 2)
+                return latent, source, speaker
             out_audio = self.vc.inference(
                 feats,
                 self._p_len_tensor,
                 self.torch_sid,
                 pitch_p,
                 pitchf_p,
-                self._rate_tensor,
-            ).float()
+                None,
+                head,
+            )
+            return self._finish_audio(
+                out_audio, audio, return_length, volume_envelope, reduced_noise
+            )
+
+    def _finish_audio(
+        self, out_audio, audio, return_length, volume_envelope, reduced_noise
+    ):
+        with torch.no_grad():
             # Match output RMS to the current block's input RMS.
             if volume_envelope < 1:
-                rms_src = audio[-(return_length * self.window) :].cpu().numpy()
-                out_audio = AudioProcessor.change_rms(
+                rms_src = audio[-(return_length * self.window) :]
+                out_audio = AudioProcessorTorch.change_rms(
                     rms_src,
                     self.sample_rate,
-                    out_audio.cpu().numpy(),
+                    out_audio,
                     self.tgt_sr,
                     volume_envelope,
-                )
-                out_audio = torch.as_tensor(out_audio, device=self.device)
-
-            scaled_window = int(np.floor(1.0 * self.model_window))
-
-            if scaled_window != self.model_window:
-                if scaled_window not in self.resamplers:
-                    self.resamplers[scaled_window] = tat.Resample(
-                        orig_freq=scaled_window,
-                        new_freq=self.model_window,
-                        dtype=torch.float32,
-                    ).to(self.device)
-                out_audio = self.resamplers[scaled_window](
-                    out_audio[: return_length * scaled_window]
+                    device=self.device,
+                    dtype=self.dtype,
                 )
 
             if reduced_noise is not None:
                 out_audio = reduced_noise(out_audio.unsqueeze(0)).squeeze(0)
-            if board is not None:
-                out_audio = torch.as_tensor(
-                    board(out_audio.cpu().numpy(), self.tgt_sr),
-                    device=self.device,
-                )
 
-        return out_audio
+        return out_audio.float()
+
+    def prepare_index(self, index_rate):
+        """Load retrieval data only while it is used, outside CUDA capture."""
+        if self.index is None:
+            return
+        if index_rate <= 0:
+            if self.index.load_attempted or self.big_tsr is not None:
+                # Captured graphs can retain the retrieval tensors as well.
+                self._graph_cache = None
+                self.big_tsr = None
+                self.index.unload()
+        elif not self.index.load_attempted:
+            self._graph_cache = None
+            self.big_tsr, _ = self.index.read_index_tensor()
+
+    def voice_conversion(self, audio, pitch=None, pitchf=None, *args, **kwargs):
+        index_rate = args[1] if len(args) > 1 else kwargs.get("index_rate", 0.5)
+        self.prepare_index(index_rate)
+        # Graphs eliminate hundreds of host kernel submissions per block. Keep
+        # eager execution for CPU/AMD and noise effects that transfer audio
+        # to the CPU.
+        proposed = args[10] if len(args) > 10 else kwargs.get("proposed_pitch", False)
+        noise = args[12] if len(args) > 12 else kwargs.get("reduced_noise")
+        if (
+            not self._graph_supported
+            or self._graph_failed
+            or self.f0_method not in ("fcpe", "rmvpe")
+            or proposed
+            or noise is not None
+        ):
+            self._graph_cache = None
+            return self._voice_conversion(audio, pitch, pitchf, *args, **kwargs)
+        key = (
+            audio.data_ptr(),
+            pitch.data_ptr() if pitch is not None else None,
+            pitchf.data_ptr() if pitchf is not None else None,
+            tuple(args),
+            tuple(sorted(kwargs.items())),
+            id(self.vc.net_g),
+            id(self.hubert_model),
+            id(self.f0_model),
+            id(self.big_tsr),
+            id(self.torch_sid),
+            self.vc.decoder_fp16,
+            self.embedder_fp16,
+            torch.backends.cuda.matmul.allow_tf32,
+            torch.backends.cudnn.allow_tf32,
+            torch.backends.cudnn.benchmark,
+        )
+        if self._graph_cache is None or self._graph_cache[0] != key:
+            self._graph_cache = None  # Release the previous graph's workspace.
+            saved_pitch = pitch.clone() if pitch is not None else None
+            saved_pitchf = pitchf.clone() if pitchf is not None else None
+            original_stream = torch.cuda.current_stream(self.device)
+            try:
+                for _ in range(3):
+                    self._voice_conversion(
+                        audio,
+                        pitch,
+                        pitchf,
+                        *args,
+                        **kwargs,
+                        return_decoder_inputs=getattr(self.vc, "onnx_decoder", False),
+                    )
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph):
+                    output = self._voice_conversion(
+                        audio,
+                        pitch,
+                        pitchf,
+                        *args,
+                        **kwargs,
+                        return_decoder_inputs=getattr(self.vc, "onnx_decoder", False),
+                    )
+                self._graph_cache = (key, graph, output)
+            except (RuntimeError, torch.OutOfMemoryError) as error:
+                self._graph_failed = True
+                raise CudaGraphCaptureError(
+                    "CUDA graph capture failed; restart with eager inference"
+                ) from error
+            finally:
+                # torch.cuda.graph's context can fail in capture_end before it
+                # restores its side stream. Eager fallback must use the caller's
+                # stream, even after a capture was invalidated.
+                torch.cuda.set_stream(original_stream)
+                if saved_pitch is not None and not self._graph_failed:
+                    pitch.copy_(saved_pitch)
+                    pitchf.copy_(saved_pitchf)
+        if self._graph_cache is None:
+            return self._voice_conversion(audio, pitch, pitchf, *args, **kwargs)
+        self._graph_cache[1].replay()
+        output = self._graph_cache[2]
+        if getattr(self.vc, "onnx_decoder", False):
+            output = self.vc.net_g.dec.run_decoder(*output)[0, 0]
+            output = torch.clip(output, -1.0, 1.0)
+            return_length = args[5] if len(args) > 5 else kwargs["return_length"]
+            volume = args[7] if len(args) > 7 else kwargs.get("volume_envelope", 1)
+            return self._finish_audio(output, audio, return_length, volume, None, None)
+        return output
 
     def _retrieve_speaker_embeddings(
-        self, skip_head, feats, index, big_npy, index_rate
+        self,
+        skip_head,
+        feats: torch.Tensor,
+        index: IndexWrapper,
+        big_tsr: torch.Tensor,
+        index_rate: float,
     ):
+        #     npy = npy.astype(np.float32)
+        #     npy = npy.astype(np.float16)
+        #     torch.from_numpy(npy).unsqueeze(0).to(self.device) * index_rate
+        #     + (1 - index_rate) * feats[0][skip_offset:]
         skip_offset = skip_head // 2
-        npy = feats[0][skip_offset:].cpu().numpy()
-        if self.dtype == torch.float16:
-            npy = npy.astype(np.float32)
-        score, ix = index.search(npy, k=8)
-        weight = np.square(1 / score)
-        weight /= weight.sum(axis=1, keepdims=True)
-        npy = np.sum(big_npy[ix] * np.expand_dims(weight, axis=2), axis=1)
-        if self.dtype == torch.float16:
-            npy = npy.astype(np.float16)
+        tsr = feats[0][skip_offset:]
+        score, ix = index.search(tsr, k=8)
+        weight = (1 / score).square()
+        weight /= weight.sum(dim=1, keepdim=True)
+        query = (big_tsr[ix] * weight.unsqueeze(2)).sum(dim=1)
+
         feats[0][skip_offset:] = (
-            torch.from_numpy(npy).unsqueeze(0).to(self.device) * index_rate
-            + (1 - index_rate) * feats[0][skip_offset:]
+            query.unsqueeze(0) * index_rate
+            + (1.0 - index_rate) * feats[0][skip_offset:]
         )
         return feats
-
-
-def load_faiss_index(file_index):
-    if file_index != "" and os.path.exists(file_index):
-        try:
-            index = faiss.read_index(file_index)
-            big_npy = index.reconstruct_n(0, index.ntotal)
-        except Exception as error:
-            print(f"An error occurred reading the FAISS index: {error}")
-            index = big_npy = None
-    else:
-        index = big_npy = None
-
-    return index, big_npy
 
 
 def create_pipeline(
@@ -432,22 +726,29 @@ def create_pipeline(
     embedder_model_custom: str = None,
     # device: str = "cuda",
     sid: int = 0,
+    device: str = None,
 ):
     """
     Initialize real-time voice conversion pipeline.
     """
 
-    vc = RealtimeVoiceConverter(model_path)
-    index, big_npy = load_faiss_index(
-        index_path.strip()
+    vc = RealtimeVoiceConverter(model_path, device=device)
+    index = IndexWrapper(
+        (index_path or "")
+        .strip()
         .strip('"')
         .strip("\n")
         .strip('"')
         .strip()
-        .replace("trained", "added")
+        .replace("trained", "added"),
+        device=vc.config.device,
+        dtype=vc.dtype,
     )
+    # Keep only the path until a positive retrieval strength is used.
+    big_tsr = None
 
     hubert_model = load_embedding(embedder_model, embedder_model_custom)
+    strip_parametrizations(hubert_model)
     hubert_model = hubert_model.to(vc.config.device).to(vc.dtype)
     hubert_model.eval()
 
@@ -455,7 +756,7 @@ def create_pipeline(
         vc,
         hubert_model,
         index,
-        big_npy,
+        big_tsr,
         f0_method,
         sid,
     )
@@ -468,9 +769,10 @@ def strip_parametrizations(module: torch.nn.Module):
     Remove all parametrizations (e.g., weight norm) from a module and log each removal.
     """
     for name, submodule in module.named_modules():
+        if hasattr(submodule, "weight_g") and hasattr(submodule, "weight_v"):
+            torch.nn.utils.remove_weight_norm(submodule)
         if hasattr(submodule, "parametrizations"):
             for pname, plist in list(submodule.parametrizations.items()):
-                # print(f"Removing parametrizations from {name}.{pname}: {[p.__class__.__name__ for p in plist]}")
                 torch.nn.utils.parametrize.remove_parametrizations(
                     submodule, pname, leave_parametrized=True
                 )

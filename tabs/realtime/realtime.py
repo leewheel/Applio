@@ -19,6 +19,14 @@ from assets.i18n.i18n import I18nAuto
 
 i18n = I18nAuto()
 
+
+def progress_str(remaining, total):
+    pct = max(0, min(100, int((total - remaining) / total * 100))) if total > 0 else 0
+    filled = "█" * (pct // 10)
+    empty = "░" * (10 - pct // 10)
+    return f"[{filled}{empty}] {pct}%"
+
+
 model_root = os.path.join(now_dir, "logs")
 custom_embedder_root = os.path.join(
     now_dir, "rvc", "models", "embedders", "embedders_custom"
@@ -59,7 +67,7 @@ def alias_score(path: str, want_model: bool) -> int:
 def get_files(type="model"):
     assert type in ("model", "index"), "Invalid type for get_files (models or index)"
     is_model = type == "model"
-    exts = (".pth", ".onnx") if is_model else (".index",)
+    exts = (".pth",) if is_model else (".index",)
     exclude_prefixes = ("G_", "D_") if is_model else ()
     exclude_substr = None if is_model else "trained"
 
@@ -91,6 +99,30 @@ def get_files(type="model"):
             order += 1
 
     return [t[2] for t in sorted(best.values(), key=lambda x: x[1])]
+
+
+def display_name(path):
+    """Dropdown label for a path: the file or folder name, without extension."""
+    return os.path.splitext(os.path.basename(path))[0]
+
+
+def path_choices(paths):
+    """
+    Convert a list of paths into (label, value) dropdown choices so only the
+    file name is displayed and announced instead of the full relative path.
+    The order of `paths` is preserved, and duplicate names are disambiguated
+    by appending the parent folder name.
+    """
+    names = [display_name(path) for path in paths]
+    counts = {}
+    for name in names:
+        counts[name] = counts.get(name, 0) + 1
+    choices = []
+    for name, path in zip(names, paths):
+        if counts[name] > 1:
+            name = f"{name} ({os.path.basename(os.path.dirname(path))})"
+        choices.append((name, path))
+    return choices
 
 
 def folders_same(
@@ -284,13 +316,14 @@ CONFIG_PATH = os.path.join(now_dir, "assets", "config.json")
 
 
 def save_realtime_settings(
-    input_device,
-    output_device,
-    monitor_device,
-    model_file,
-    index_file,
+    input_device=None,
+    output_device=None,
+    monitor_device=None,
+    model_file=None,
+    index_file=None,
     asio_enabled=None,
     audio_sample_rate=None,
+    **kwargs,
 ):
     """Save realtime settings to config.json"""
     try:
@@ -318,12 +351,16 @@ def save_realtime_settings(
             ] = (monitor_device or "")
         if model_file is not None:
             config["realtime"]["model_file"] = model_file or ""
-        if monitor_device is not None:
+        if index_file is not None:
             config["realtime"]["index_file"] = index_file or ""
         if asio_enabled is not None:
             config["realtime"]["asio_enabled"] = asio_enabled
         if audio_sample_rate is not None:
             config["realtime"]["audio_sample_rate"] = audio_sample_rate
+
+        for key, val in kwargs.items():
+            if val is not None:
+                config["realtime"][key] = val
 
         with open(CONFIG_PATH, "w", encoding="utf-8") as f:
             json.dump(config, f, indent=2, ensure_ascii=False)
@@ -333,46 +370,45 @@ def save_realtime_settings(
 
 def load_realtime_settings():
     """Load realtime settings from config.json"""
-    try:
-        if os.path.exists(CONFIG_PATH):
-            with open(CONFIG_PATH, "r", encoding="utf-8") as f:
-                config = json.load(f)
-                realtime_config = config.get("realtime", {})
-                return {
-                    "input_device": realtime_config.get("input_device", ""),
-                    "output_device": realtime_config.get("output_device", ""),
-                    "monitor_device": realtime_config.get("monitor_device", ""),
-                    "client_input_device": realtime_config.get(
-                        "client_input_device", ""
-                    ),
-                    "client_output_device": realtime_config.get(
-                        "client_output_device", ""
-                    ),
-                    "client_monitor_device": realtime_config.get(
-                        "client_monitor_device", ""
-                    ),
-                    "model_file": realtime_config.get("model_file", ""),
-                    "index_file": realtime_config.get("index_file", ""),
-                    "asio_enabled": realtime_config.get("asio_enabled", False),
-                    "audio_sample_rate": realtime_config.get(
-                        "audio_sample_rate", 48000
-                    ),
-                }
-    except Exception as e:
-        print(f"Error loading realtime settings: {e}")
-
-    return {
+    defaults = {
         "input_device": "",
         "output_device": "",
         "monitor_device": "",
         "client_input_device": "",
         "client_output_device": "",
         "client_monitor_device": "",
+        "use_monitor_device": False,
         "model_file": "",
         "index_file": "",
         "asio_enabled": False,
         "audio_sample_rate": AUDIO_SAMPLE_RATE,
+        "input_audio_gain": 100,
+        "output_audio_gain": 100,
+        "monitor_audio_gain": 100,
+        "chunk_size": 250.0,
+        "extra_convert_size": 2.5,
+        "cross_fade_overlap_size": 0.05,
+        "silent_threshold": -60,
+        "vad_enabled": True,
+        "pitch": 0,
+        "index_rate": 0.0,
+        "volume_envelope": 1.0,
+        "protect": 0.33,
+        "terms_accepted": False,
     }
+    try:
+        if os.path.exists(CONFIG_PATH):
+            with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+                config = json.load(f)
+                realtime_config = config.get("realtime", {})
+                for k in defaults.keys():
+                    if k in realtime_config:
+                        defaults[k] = realtime_config[k]
+                return defaults
+    except Exception as e:
+        print(f"Error loading realtime settings: {e}")
+
+    return defaults
 
 
 def get_safe_dropdown_value(saved_value, choices, fallback_value=None):
@@ -417,6 +453,24 @@ def get_safe_index_value(saved_value, choices, fallback_value=None):
         return None
 
 
+def _cleanup_realtime():
+    global running, callbacks, audio_manager
+    running = False
+    if audio_manager is not None:
+        try:
+            audio_manager.stop()
+        except Exception:
+            pass
+    if callbacks is not None:
+        if hasattr(callbacks, "vc"):
+            try:
+                callbacks.vc.stop()
+            except Exception:
+                pass
+    audio_manager = None
+    callbacks = None
+
+
 def start_realtime(
     input_audio_device: str,
     input_audio_gain: int,
@@ -449,76 +503,67 @@ def start_realtime(
     proposed_pitch_threshold: float,
     embedder_model: str,
     embedder_model_custom: str = None,
-    clean_audio: bool = False,
-    clean_strength: float = 0.5,
-    post_process: bool = False,
-    reverb: bool = False,
-    pitch_shift: bool = False,
-    limiter: bool = False,
-    gain: bool = False,
-    distortion: bool = False,
-    chorus: bool = False,
-    bitcrush: bool = False,
-    clipping: bool = False,
-    compressor: bool = False,
-    delay: bool = False,
-    reverb_room_size: float = 0.5,
-    reverb_damping: float = 0.5,
-    reverb_wet_gain: float = 0.5,
-    reverb_dry_gain: float = 0.5,
-    reverb_width: float = 0.5,
-    reverb_freeze_mode: float = 0.5,
-    pitch_shift_semitones: float = 0.0,
-    limiter_threshold: float = -6,
-    limiter_release_time: float = 0.01,
-    gain_db: float = 0.0,
-    distortion_gain: float = 25,
-    chorus_rate: float = 1.0,
-    chorus_depth: float = 0.25,
-    chorus_center_delay: float = 7,
-    chorus_feedback: float = 0.0,
-    chorus_mix: float = 0.5,
-    bitcrush_bit_depth: int = 8,
-    clipping_threshold: float = -6,
-    compressor_threshold: float = 0,
-    compressor_ratio: float = 1,
-    compressor_attack: float = 1.0,
-    compressor_release: float = 100,
-    delay_seconds: float = 0.5,
-    delay_feedback: float = 0.0,
-    delay_mix: float = 0.5,
+    formant_shifting: bool = False,
+    formant_qfrency: float = 1.0,
+    formant_timbre: float = 1.0,
     record_audio: bool = False,
     record_audio_path: str = None,
     export_format: str = "WAV",
 ):
     global running, callbacks, audio_manager, callbacks_kwargs
-    running = True
 
     if not input_audio_device or not output_audio_device:
+        _cleanup_realtime()
         yield (
-            "Please select valid input/output devices!",
+            i18n("Please select valid input/output devices!"),
             interactive_true,
             interactive_false,
         )
         return
     if use_monitor_device and not monitor_output_device:
+        _cleanup_realtime()
         yield (
-            "Please select a valid monitor device!",
+            i18n("Please select a valid monitor device!"),
             interactive_true,
             interactive_false,
         )
         return
     if not pth_path:
+        _cleanup_realtime()
         yield (
-            "Model path not provided. Aborting conversion.",
+            i18n("Model path not provided. Aborting conversion."),
             interactive_true,
             interactive_false,
         )
         return
 
-    yield "Starting Realtime...", interactive_false, interactive_visible
+    running = True
+
+    print(f"Starting Realtime...")
+    yield i18n("Starting Realtime..."), interactive_false, interactive_visible
 
     sid = int(sid) if sid is not None else 0
+
+    save_realtime_settings(
+        input_device=input_audio_device,
+        output_device=output_audio_device,
+        monitor_device=monitor_output_device,
+        model_file=pth_path,
+        index_file=index_path,
+        use_monitor_device=use_monitor_device,
+        input_audio_gain=int(input_audio_gain),
+        output_audio_gain=int(output_audio_gain),
+        monitor_audio_gain=int(monitor_audio_gain),
+        vad_enabled=vad_enabled,
+        chunk_size=chunk_size,
+        cross_fade_overlap_size=cross_fade_overlap_size,
+        extra_convert_size=extra_convert_size,
+        silent_threshold=silent_threshold,
+        pitch=pitch,
+        index_rate=index_rate,
+        volume_envelope=volume_envelope,
+        protect=protect,
+    )
 
     input_audio_gain /= 100.0
     output_audio_gain /= 100.0
@@ -532,7 +577,13 @@ def start_realtime(
             output_devices[monitor_output_device] if use_monitor_device else None
         )
     except (ValueError, IndexError):
-        yield "Incorrectly formatted audio device. Stopping.", interactive_true, interactive_false
+        _cleanup_realtime()
+        print(f"Error: incorrectly formatted audio device.")
+        yield (
+            i18n("Incorrectly formatted audio device. Stopping."),
+            interactive_true,
+            interactive_false,
+        )
         return
 
     # Load ASIO and sample rate settings from config.
@@ -542,11 +593,11 @@ def start_realtime(
     audio_sample_rate = resolve_sample_rate(
         input_device_id, asio_enabled, audio_sample_rate
     )
-    read_chunk_size = int(chunk_size * audio_sample_rate / 1000 / 128)
+    block_frame = int(chunk_size * audio_sample_rate / 1000)
 
     callbacks_kwargs = {
         "pass_through": PASS_THROUGH,
-        "read_chunk_size": read_chunk_size,
+        "block_frame": block_frame,
         "cross_fade_overlap_size": cross_fade_overlap_size,
         "extra_convert_size": extra_convert_size,
         "model_path": pth_path,
@@ -571,50 +622,13 @@ def start_realtime(
         "vad_sensitivity": 3,
         "vad_frame_ms": 30,
         "sid": sid,
-        "clean_audio": clean_audio,
-        "clean_strength": clean_strength,
-        "post_process": post_process,
+        "formant_shifting": formant_shifting,
+        "formant_qfrency": formant_qfrency,
+        "formant_timbre": formant_timbre,
         "record_audio": record_audio,
         "record_audio_path": record_audio_path,
         "export_format": export_format,
         "audio_sample_rate": audio_sample_rate,
-        "kwargs": {
-            "reverb": reverb,
-            "pitch_shift": pitch_shift,
-            "limiter": limiter,
-            "gain": gain,
-            "distortion": distortion,
-            "chorus": chorus,
-            "bitcrush": bitcrush,
-            "clipping": clipping,
-            "compressor": compressor,
-            "delay": delay,
-            "reverb_room_size": reverb_room_size,
-            "reverb_damping": reverb_damping,
-            "reverb_wet_level": reverb_wet_gain,
-            "reverb_dry_level": reverb_dry_gain,
-            "reverb_width": reverb_width,
-            "reverb_freeze_mode": reverb_freeze_mode,
-            "pitch_shift_semitones": pitch_shift_semitones,
-            "limiter_threshold": limiter_threshold,
-            "limiter_release": limiter_release_time,
-            "gain_db": gain_db,
-            "distortion_gain": distortion_gain,
-            "chorus_rate": chorus_rate,
-            "chorus_depth": chorus_depth,
-            "chorus_delay": chorus_center_delay,
-            "chorus_feedback": chorus_feedback,
-            "chorus_mix": chorus_mix,
-            "bitcrush_bit_depth": bitcrush_bit_depth,
-            "clipping_threshold": clipping_threshold,
-            "compressor_threshold": compressor_threshold,
-            "compressor_ratio": compressor_ratio,
-            "compressor_attack": compressor_attack,
-            "compressor_release": compressor_release,
-            "delay_seconds": delay_seconds,
-            "delay_feedback": delay_feedback,
-            "delay_mix": delay_mix,
-        },
     }
 
     callbacks = AudioCallbacks(**callbacks_kwargs)
@@ -629,36 +643,122 @@ def start_realtime(
             asio_input_channel=input_asio_channels if asio_enabled else -1,
             asio_output_channel=output_asio_channels if asio_enabled else -1,
             asio_output_monitor_channel=monitor_asio_channels if asio_enabled else -1,
-            read_chunk_size=read_chunk_size,
+            block_frame=block_frame,
             audio_sample_rate=audio_sample_rate,
             asio_output_stereo=asio_output_stereo,
         )
     except Exception as error:
-        running = False
-        yield str(error), interactive_true, interactive_false
+        _cleanup_realtime()
+        print(f"Realtime error: {error}")
+        yield i18n("Error: {}").format(error), interactive_true, interactive_false
         return
 
-    yield "Realtime is ready!", interactive_false, interactive_visible
+    print(f"Loading model...")
+    yield "Loading model...", interactive_false, interactive_visible
+
+    # Wait for the worker process to finish loading the model
+    load_start = time.time()
+    last_report = 0
+    while running and callbacks is not None:
+        time.sleep(0.1)
+        if (
+            hasattr(callbacks.vc, "_process")
+            and callbacks.vc._process is not None
+            and not callbacks.vc._process.is_alive()
+        ):
+            print(f"Worker process died during model loading.")
+            _cleanup_realtime()
+            yield (
+                "Worker process crashed during model loading.",
+                interactive_true,
+                interactive_false,
+            )
+            return
+        if getattr(callbacks.vc, "ready", False):
+            break
+        if time.time() - load_start > 300:
+            print(f"Model loading timed out.")
+            _cleanup_realtime()
+            yield (
+                "Model loading timed out.",
+                interactive_true,
+                interactive_false,
+            )
+            return
+        elapsed = int(time.time() - load_start)
+        if elapsed > last_report:
+            last_report = elapsed
+            print(f"Loading model... ({elapsed}s)")
+            yield (
+                f"Loading model... ({elapsed}s)",
+                interactive_false,
+                interactive_visible,
+            )
+
+    if not running or callbacks is None:
+        _cleanup_realtime()
+        return (
+            i18n("Realtime stopped."),
+            interactive_true,
+            interactive_false,
+        )
+
+    print(f"Realtime is starting!")
+    yield i18n("Realtime is starting!"), interactive_false, interactive_visible
+
+    warmup_total = getattr(callbacks.vc.vc_model, "warmup_blocks", 0)
 
     while running and callbacks is not None and audio_manager is not None:
         time.sleep(0.1)
-        if hasattr(audio_manager, "latency") and hasattr(audio_manager, "volume"):
+        # Snapshot global callbacks and audio_manager into local variables to prevent
+        # race conditions where stop_realtime() concurrently clears them to None.
+        cb = callbacks
+        am = audio_manager
+        if not running or cb is None or am is None:
+            break
+        if (
+            hasattr(cb, "vc")
+            and hasattr(cb.vc, "_process")
+            and cb.vc._process is not None
+            and not cb.vc._process.is_alive()
+        ):
+            print(f"Worker process died during realtime processing.")
+            _cleanup_realtime()
+            yield (
+                "Worker process crashed.",
+                interactive_true,
+                interactive_false,
+            )
+            return
+        if hasattr(am, "latency") and hasattr(am, "volume"):
             warmup_remaining = (
-                callbacks.vc.vc_model.warmup_blocks
-                if callbacks is not None
-                and hasattr(callbacks, "vc")
-                and hasattr(callbacks.vc, "vc_model")
-                and hasattr(callbacks.vc.vc_model, "warmup_blocks")
+                getattr(cb.vc.vc_model, "warmup_blocks", 0)
+                if hasattr(cb, "vc") and hasattr(cb.vc, "vc_model")
                 else 0
             )
-            if warmup_remaining > 0:
-                yield i18n("Warming up... ({} blocks remaining)").format(
-                    warmup_remaining
-                ), interactive_false, interactive_true
-            else:
-                yield f"Latency: {audio_manager.latency:.2f} ms | Volume: {audio_manager.volume:.2f} dB", interactive_false, interactive_true
 
-    return gr.update(), gr.update(), gr.update()
+            if warmup_remaining > 0:
+                bar = progress_str(warmup_remaining, warmup_total)
+                yield (
+                    i18n("Warming up... ({} blocks) {}").format(warmup_remaining, bar),
+                    interactive_false,
+                    interactive_true,
+                )
+            else:
+                yield (
+                    i18n("Latency: {:.2f} ms | Volume: {:.2f} dB").format(
+                        am.latency, am.volume
+                    ),
+                    interactive_false,
+                    interactive_true,
+                )
+
+    _cleanup_realtime()
+    yield (
+        i18n("Realtime stopped."),
+        interactive_true,
+        interactive_false,
+    )
 
 
 def change_callbacks_config():
@@ -668,7 +768,7 @@ def change_callbacks_config():
         # print(callbacks_kwargs)
 
         # It will need to create a new stream to work.
-        # callbacks.vc.block_frame = callbacks_kwargs.get("read_chunk_size", 192) * 128
+        # callbacks.vc.block_frame = callbacks_kwargs.get("block_frame", 192)
         crossfade_frame = int(
             callbacks_kwargs.get("cross_fade_overlap_size", 0.1) * AUDIO_SAMPLE_RATE
         )
@@ -693,11 +793,9 @@ def change_callbacks_config():
         cfg["vad_sensitivity"] = callbacks_kwargs.get("vad_sensitivity", 3)
         cfg["vad_frame_ms"] = callbacks_kwargs.get("vad_frame_ms", 30)
 
-        cfg["clean_audio"] = callbacks_kwargs.get("clean_audio", False)
-        cfg["clean_strength"] = callbacks_kwargs.get("clean_strength", 0.5)
-
-        cfg["post_process"] = callbacks_kwargs.get("post_process", False)
-        cfg["pedalboard_kwargs"] = callbacks_kwargs.get("kwargs", {})
+        cfg["formant_shifting"] = callbacks_kwargs.get("formant_shifting", False)
+        cfg["formant_qfrency"] = callbacks_kwargs.get("formant_qfrency", 1.0)
+        cfg["formant_timbre"] = callbacks_kwargs.get("formant_timbre", 1.0)
 
         cfg["model_path"] = callbacks_kwargs.get("model_path", "")
         cfg["sid"] = callbacks_kwargs.get("sid", 0)
@@ -735,9 +833,9 @@ def change_config(value, key, if_kwargs=False):
     global callbacks_kwargs
 
     if running and audio_manager is not None and callbacks is not None:
-        if if_kwargs:
-            callbacks_kwargs["kwargs"][key] = value
-        else:
+        if if_kwargs and value is not None:
+            callbacks_kwargs.setdefault("kwargs", {})[key] = value
+        elif value is not None:
             callbacks_kwargs[key] = value
 
         change_callbacks_config()
@@ -746,22 +844,18 @@ def change_config(value, key, if_kwargs=False):
 def stop_realtime():
     global running, callbacks, audio_manager
     if running and audio_manager is not None and callbacks is not None:
-        audio_manager.stop()
-        callbacks.vc.stop()
-        running = False
-        if hasattr(audio_manager, "latency"):
-            del audio_manager.latency
-        del audio_manager, callbacks
-        audio_manager = callbacks = None
+        _cleanup_realtime()
         time.sleep(0.1)
 
+        print(f"Realtime stopped.")
         return (
-            "Stopped",
+            i18n("Realtime stopped."),
             interactive_true,
             interactive_false,
         )
     else:
-        return "Realtime pipeline not found!", interactive_true, interactive_false
+        _cleanup_realtime()
+        return i18n("Realtime pipeline not found!"), interactive_true, interactive_false
 
 
 def get_audio_devices_formatted():
@@ -849,7 +943,7 @@ def soundfile_record_audio(
 
     if running and audio_manager is not None and callbacks is not None:
         if record_button == "Start":
-            gr.Info("Start recording...")
+            gr.Info(i18n("Start recording..."))
 
             if not record_audio_path:
                 record_audio_path = os.path.join(
@@ -866,13 +960,13 @@ def soundfile_record_audio(
 
             return "Stop", None
         else:
-            gr.Info("Stop recording!")
+            gr.Info(i18n("Stop recording!"))
 
             callbacks.vc.send_config({"record_stop": True})
 
             return "Start", record_audio_path
 
-    gr.Warning("Realtime pipeline not found!")
+    gr.Warning(i18n("Realtime pipeline not found!"))
     return "Start", None
 
 
@@ -913,7 +1007,7 @@ def realtime_tab():
             info=i18n(
                 "Please ensure compliance with the terms and conditions detailed in [this document](https://github.com/IAHispano/Applio/blob/main/TERMS_OF_USE.md) before proceeding with your realtime."
             ),
-            value=False,
+            value=saved_settings.get("terms_accepted", False),
             interactive=True,
         )
 
@@ -945,7 +1039,7 @@ def realtime_tab():
                             input_audio_gain = gr.Slider(
                                 minimum=0,
                                 maximum=200,
-                                value=100,
+                                value=saved_settings.get("input_audio_gain", 100),
                                 label=i18n("Input Gain (%)"),
                                 info=i18n(
                                     "Adjusts the input volume before processing. Prevents clipping or boosts a quiet mic."
@@ -984,7 +1078,7 @@ def realtime_tab():
                             output_audio_gain = gr.Slider(
                                 minimum=0,
                                 maximum=200,
-                                value=100,
+                                value=saved_settings.get("output_audio_gain", 100),
                                 label=i18n("Output Gain (%)"),
                                 info=i18n(
                                     "Adjusts the final volume of the converted voice after processing."
@@ -1010,7 +1104,7 @@ def realtime_tab():
                     with gr.Column():
                         use_monitor_device = gr.Checkbox(
                             label=i18n("Use Monitor Device"),
-                            value=False,
+                            value=saved_settings.get("use_monitor_device", False),
                             interactive=True,
                         )
                         monitor_output_device = gr.Dropdown(
@@ -1034,7 +1128,7 @@ def realtime_tab():
                         monitor_audio_gain = gr.Slider(
                             minimum=0,
                             maximum=200,
-                            value=100,
+                            value=saved_settings.get("monitor_audio_gain", 100),
                             label=i18n("Monitor Gain (%)"),
                             info=i18n(
                                 "Adjusts the volume of the monitor feed, independent of the main output."
@@ -1089,18 +1183,19 @@ def realtime_tab():
                         info=i18n(
                             "Enables Voice Activity Detection to only process audio when you are speaking, saving CPU."
                         ),
-                        value=True,
+                        value=saved_settings.get("vad_enabled", True),
                         interactive=True,
                     )
 
             with gr.TabItem(i18n("Model Settings")):
+                gr.Markdown(value=i18n("## Model Selection"))
                 with gr.Row():
                     model_choices = (
                         sorted(names, key=extract_model_and_epoch) if names else []
                     )
                     model_file = gr.Dropdown(
                         label=i18n("Voice Model"),
-                        choices=model_choices,
+                        choices=path_choices(model_choices),
                         interactive=True,
                         value=get_safe_dropdown_value(
                             saved_settings["model_file"], model_choices, default_weight
@@ -1110,7 +1205,7 @@ def realtime_tab():
                     index_choices = sorted(get_files("index"))
                     index_file = gr.Dropdown(
                         label=i18n("Index File"),
-                        choices=index_choices,
+                        choices=path_choices(index_choices),
                         value=get_safe_index_value(
                             saved_settings["index_file"],
                             index_choices,
@@ -1122,8 +1217,9 @@ def realtime_tab():
 
                 with gr.Row():
                     unload_button = gr.Button(i18n("Unload Voice"))
-                    refresh_button = gr.Button(i18n("Refresh"))
+                    refresh_button = gr.Button(i18n("Refresh models and indexes"))
                 with gr.Column():
+                    gr.Markdown(value=i18n("## Advanced Settings"))
                     autotune = gr.Checkbox(
                         label=i18n("Autotune"),
                         info=i18n(
@@ -1164,328 +1260,34 @@ def realtime_tab():
                         value=155.0,
                         interactive=True,
                     )
-                    clean_audio = gr.Checkbox(
-                        label=i18n("Clean Audio"),
+                    formant_shifting = gr.Checkbox(
+                        label=i18n("Formant Shifting"),
                         info=i18n(
-                            "Clean your audio output using noise detection algorithms, recommended for speaking audios."
+                            "Enable formant shifting. Used for male to female and vice-versa convertions."
                         ),
                         visible=True,
                         value=False,
                         interactive=True,
                     )
-                    clean_strength = gr.Slider(
+                    formant_qfrency = gr.Slider(
                         minimum=0,
-                        maximum=1,
-                        label=i18n("Clean Strength"),
-                        info=i18n(
-                            "Set the clean-up level to the audio you want, the more you increase it the more it will clean up, but it is possible that the audio will be more compressed."
-                        ),
+                        maximum=16,
+                        step=0.1,
+                        label=i18n("Quefrency for formant shifting"),
+                        info=i18n("Modifies formants width and spectral envelope."),
                         visible=False,
-                        value=0.5,
-                        interactive=True,
-                    )
-                    post_process = gr.Checkbox(
-                        label=i18n("Post-Process"),
-                        info=i18n(
-                            "Post-process the audio to apply effects to the output."
-                        ),
-                        value=False,
-                        interactive=True,
-                    )
-                    reverb = gr.Checkbox(
-                        label=i18n("Reverb"),
-                        info=i18n("Apply reverb to the audio."),
-                        value=False,
-                        interactive=True,
-                        visible=False,
-                    )
-                    reverb_room_size = gr.Slider(
-                        minimum=0,
-                        maximum=1,
-                        label=i18n("Reverb Room Size"),
-                        info=i18n("Set the room size of the reverb."),
-                        value=0.5,
-                        interactive=True,
-                        visible=False,
-                    )
-                    reverb_damping = gr.Slider(
-                        minimum=0,
-                        maximum=1,
-                        label=i18n("Reverb Damping"),
-                        info=i18n("Set the damping of the reverb."),
-                        value=0.5,
-                        interactive=True,
-                        visible=False,
-                    )
-                    reverb_wet_gain = gr.Slider(
-                        minimum=0,
-                        maximum=1,
-                        label=i18n("Reverb Wet Gain"),
-                        info=i18n("Set the wet gain of the reverb."),
-                        value=0.33,
-                        interactive=True,
-                        visible=False,
-                    )
-                    reverb_dry_gain = gr.Slider(
-                        minimum=0,
-                        maximum=1,
-                        label=i18n("Reverb Dry Gain"),
-                        info=i18n("Set the dry gain of the reverb."),
-                        value=0.4,
-                        interactive=True,
-                        visible=False,
-                    )
-                    reverb_width = gr.Slider(
-                        minimum=0,
-                        maximum=1,
-                        label=i18n("Reverb Width"),
-                        info=i18n("Set the width of the reverb."),
                         value=1.0,
                         interactive=True,
-                        visible=False,
                     )
-                    reverb_freeze_mode = gr.Slider(
+                    formant_timbre = gr.Slider(
                         minimum=0,
-                        maximum=1,
-                        label=i18n("Reverb Freeze Mode"),
-                        info=i18n("Set the freeze mode of the reverb."),
-                        value=0.0,
-                        interactive=True,
+                        maximum=16,
+                        step=0.1,
+                        label=i18n("Timbre for formant shifting"),
+                        info=i18n("Adjusts vocal tract length / timbre brightness."),
                         visible=False,
-                    )
-                    pitch_shift = gr.Checkbox(
-                        label=i18n("Pitch Shift"),
-                        info=i18n("Apply pitch shift to the audio."),
-                        value=False,
-                        interactive=True,
-                        visible=False,
-                    )
-                    pitch_shift_semitones = gr.Slider(
-                        minimum=-12,
-                        maximum=12,
-                        label=i18n("Pitch Shift Semitones"),
-                        info=i18n("Set the pitch shift semitones."),
-                        value=0,
-                        interactive=True,
-                        visible=False,
-                    )
-                    limiter = gr.Checkbox(
-                        label=i18n("Limiter"),
-                        info=i18n("Apply limiter to the audio."),
-                        value=False,
-                        interactive=True,
-                        visible=False,
-                    )
-                    limiter_threshold = gr.Slider(
-                        minimum=-60,
-                        maximum=0,
-                        label=i18n("Limiter Threshold dB"),
-                        info=i18n("Set the limiter threshold dB."),
-                        value=-6,
-                        interactive=True,
-                        visible=False,
-                    )
-                    limiter_release_time = gr.Slider(
-                        minimum=0.01,
-                        maximum=1,
-                        label=i18n("Limiter Release Time"),
-                        info=i18n("Set the limiter release time."),
-                        value=0.05,
-                        interactive=True,
-                        visible=False,
-                    )
-                    gain = gr.Checkbox(
-                        label=i18n("Gain"),
-                        info=i18n("Apply gain to the audio."),
-                        value=False,
-                        interactive=True,
-                        visible=False,
-                    )
-                    gain_db = gr.Slider(
-                        minimum=-60,
-                        maximum=60,
-                        label=i18n("Gain dB"),
-                        info=i18n("Set the gain dB."),
-                        value=0,
-                        interactive=True,
-                        visible=False,
-                    )
-                    distortion = gr.Checkbox(
-                        label=i18n("Distortion"),
-                        info=i18n("Apply distortion to the audio."),
-                        value=False,
-                        interactive=True,
-                        visible=False,
-                    )
-                    distortion_gain = gr.Slider(
-                        minimum=-60,
-                        maximum=60,
-                        label=i18n("Distortion Gain"),
-                        info=i18n("Set the distortion gain."),
-                        value=25,
-                        interactive=True,
-                        visible=False,
-                    )
-                    chorus = gr.Checkbox(
-                        label=i18n("Chorus"),
-                        info=i18n("Apply chorus to the audio."),
-                        value=False,
-                        interactive=True,
-                        visible=False,
-                    )
-                    chorus_rate = gr.Slider(
-                        minimum=0,
-                        maximum=100,
-                        label=i18n("Chorus Rate Hz"),
-                        info=i18n("Set the chorus rate Hz."),
                         value=1.0,
                         interactive=True,
-                        visible=False,
-                    )
-                    chorus_depth = gr.Slider(
-                        minimum=0,
-                        maximum=1,
-                        label=i18n("Chorus Depth"),
-                        info=i18n("Set the chorus depth."),
-                        value=0.25,
-                        interactive=True,
-                        visible=False,
-                    )
-                    chorus_center_delay = gr.Slider(
-                        minimum=7,
-                        maximum=8,
-                        label=i18n("Chorus Center Delay ms"),
-                        info=i18n("Set the chorus center delay ms."),
-                        value=7,
-                        interactive=True,
-                        visible=False,
-                    )
-                    chorus_feedback = gr.Slider(
-                        minimum=0,
-                        maximum=1,
-                        label=i18n("Chorus Feedback"),
-                        info=i18n("Set the chorus feedback."),
-                        value=0.0,
-                        interactive=True,
-                        visible=False,
-                    )
-                    chorus_mix = gr.Slider(
-                        minimum=0,
-                        maximum=1,
-                        label=i18n("Chorus Mix"),
-                        info=i18n("Set the chorus mix."),
-                        value=0.5,
-                        interactive=True,
-                        visible=False,
-                    )
-                    bitcrush = gr.Checkbox(
-                        label=i18n("Bitcrush"),
-                        info=i18n("Apply bitcrush to the audio."),
-                        value=False,
-                        interactive=True,
-                        visible=False,
-                    )
-                    bitcrush_bit_depth = gr.Slider(
-                        minimum=1,
-                        maximum=32,
-                        label=i18n("Bitcrush Bit Depth"),
-                        info=i18n("Set the bitcrush bit depth."),
-                        value=8,
-                        interactive=True,
-                        visible=False,
-                    )
-                    clipping = gr.Checkbox(
-                        label=i18n("Clipping"),
-                        info=i18n("Apply clipping to the audio."),
-                        value=False,
-                        interactive=True,
-                        visible=False,
-                    )
-                    clipping_threshold = gr.Slider(
-                        minimum=-60,
-                        maximum=0,
-                        label=i18n("Clipping Threshold"),
-                        info=i18n("Set the clipping threshold."),
-                        value=-6,
-                        interactive=True,
-                        visible=False,
-                    )
-                    compressor = gr.Checkbox(
-                        label=i18n("Compressor"),
-                        info=i18n("Apply compressor to the audio."),
-                        value=False,
-                        interactive=True,
-                        visible=False,
-                    )
-                    compressor_threshold = gr.Slider(
-                        minimum=-60,
-                        maximum=0,
-                        label=i18n("Compressor Threshold dB"),
-                        info=i18n("Set the compressor threshold dB."),
-                        value=0,
-                        interactive=True,
-                        visible=False,
-                    )
-                    compressor_ratio = gr.Slider(
-                        minimum=1,
-                        maximum=20,
-                        label=i18n("Compressor Ratio"),
-                        info=i18n("Set the compressor ratio."),
-                        value=1,
-                        interactive=True,
-                        visible=False,
-                    )
-                    compressor_attack = gr.Slider(
-                        minimum=0.0,
-                        maximum=100,
-                        label=i18n("Compressor Attack ms"),
-                        info=i18n("Set the compressor attack ms."),
-                        value=1.0,
-                        interactive=True,
-                        visible=False,
-                    )
-                    compressor_release = gr.Slider(
-                        minimum=0.01,
-                        maximum=100,
-                        label=i18n("Compressor Release ms"),
-                        info=i18n("Set the compressor release ms."),
-                        value=100,
-                        interactive=True,
-                        visible=False,
-                    )
-                    delay = gr.Checkbox(
-                        label=i18n("Delay"),
-                        info=i18n("Apply delay to the audio."),
-                        value=False,
-                        interactive=True,
-                        visible=False,
-                    )
-                    delay_seconds = gr.Slider(
-                        minimum=0.0,
-                        maximum=5.0,
-                        label=i18n("Delay Seconds"),
-                        info=i18n("Set the delay seconds."),
-                        value=0.5,
-                        interactive=True,
-                        visible=False,
-                    )
-                    delay_feedback = gr.Slider(
-                        minimum=0.0,
-                        maximum=1.0,
-                        label=i18n("Delay Feedback"),
-                        info=i18n("Set the delay feedback."),
-                        value=0.0,
-                        interactive=True,
-                        visible=False,
-                    )
-                    delay_mix = gr.Slider(
-                        minimum=0.0,
-                        maximum=1.0,
-                        label=i18n("Delay Mix"),
-                        info=i18n("Set the delay mix."),
-                        value=0.5,
-                        interactive=True,
-                        visible=False,
                     )
                     sid = gr.Dropdown(
                         label=i18n("Speaker ID"),
@@ -1503,7 +1305,7 @@ def realtime_tab():
                         info=i18n(
                             "Set the pitch of the audio, the higher the value, the higher the pitch."
                         ),
-                        value=0,
+                        value=saved_settings.get("pitch", 0),
                         interactive=True,
                     )
                     index_rate = gr.Slider(
@@ -1513,13 +1315,13 @@ def realtime_tab():
                         info=i18n(
                             "Influence exerted by the index file; a higher value corresponds to greater influence. However, opting for lower values can help mitigate artifacts present in the audio."
                         ),
-                        value=0,  # The index is not always necessary, so disabling it can help improve latency.
+                        value=saved_settings.get("index_rate", 0),
                         interactive=True,
                     )
                     volume_envelope = gr.Slider(
                         minimum=0,
                         maximum=1,
-                        value=1,
+                        value=saved_settings.get("volume_envelope", 1),
                         label=i18n("Volume Envelope"),
                         info=i18n(
                             "Substitute or blend with the volume envelope of the output. The closer the ratio is to 1, the more the output envelope is employed."
@@ -1529,7 +1331,7 @@ def realtime_tab():
                     protect = gr.Slider(
                         minimum=0,
                         maximum=0.5,
-                        value=0.33,
+                        value=saved_settings.get("protect", 0.33),
                         label=i18n("Protect Voiceless Consonants"),
                         info=i18n(
                             "Safeguard distinct consonants and breathing sounds to prevent electro-acoustic tearing and other artifacts. Pulling the parameter to its maximum value of 0.5 offers comprehensive protection. However, reducing this value might decrease the extent of protection while potentially mitigating the indexing effect."
@@ -1537,7 +1339,7 @@ def realtime_tab():
                         interactive=True,
                     )
                     f0_method = gr.Radio(
-                        choices=["rmvpe", "fcpe"],
+                        choices=["rmvpe", "fcpe", "crepe", "swift"],
                         value="fcpe",
                         label=i18n("Pitch extraction algorithm"),
                         info=i18n(
@@ -1565,7 +1367,7 @@ def realtime_tab():
                             with gr.Row():
                                 embedder_model_custom = gr.Dropdown(
                                     label=i18n("Select Custom Embedder"),
-                                    choices=refresh_embedders_folders(),
+                                    choices=path_choices(refresh_embedders_folders()),
                                     interactive=True,
                                     allow_custom_value=True,
                                 )
@@ -1594,7 +1396,7 @@ def realtime_tab():
                 chunk_size = gr.Slider(
                     minimum=2.7,
                     maximum=2730.7,
-                    value=250,
+                    value=saved_settings.get("chunk_size", 250),
                     step=1,
                     label=i18n("Chunk Size (ms)"),
                     info=i18n(
@@ -1605,7 +1407,7 @@ def realtime_tab():
                 cross_fade_overlap_size = gr.Slider(
                     minimum=0.05,
                     maximum=0.2,
-                    value=0.05,
+                    value=saved_settings.get("cross_fade_overlap_size", 0.05),
                     step=0.01,
                     label=i18n("Crossfade Overlap Size (s)"),
                     info=i18n(
@@ -1616,7 +1418,7 @@ def realtime_tab():
                 extra_convert_size = gr.Slider(
                     minimum=0.1,
                     maximum=5,
-                    value=2.5,
+                    value=saved_settings.get("extra_convert_size", 2.5),
                     step=0.1,
                     label=i18n("Extra Conversion Size (s)"),
                     info=i18n(
@@ -1627,7 +1429,7 @@ def realtime_tab():
                 silent_threshold = gr.Slider(
                     minimum=-90,
                     maximum=-60,
-                    value=-60,
+                    value=saved_settings.get("silent_threshold", -60),
                     step=1,
                     label=i18n("Silence Threshold (dB)"),
                     info=i18n(
@@ -1642,11 +1444,41 @@ def realtime_tab():
 
         def enforce_terms(terms_accepted, *args):
             if not terms_accepted:
-                message = "You must agree to the Terms of Use to proceed."
+                message = i18n("You must agree to the Terms of Use to proceed.")
                 gr.Info(message)
                 yield message, interactive_true, interactive_false
                 return
             yield from start_realtime(*args)
+
+        def _realtime_with_toast(terms_accepted, *args):
+            if not terms_accepted:
+                # enforce_terms explains the rejection with its own toast.
+                yield from enforce_terms(terms_accepted, *args)
+                return
+            gr.Info(i18n("Starting real-time conversion..."))
+            # start_realtime reports failures as yielded status strings
+            # instead of raising, so warn about them for screen reader
+            # users. The status text is translated, so failures are
+            # detected structurally instead of by matching English words:
+            # every failure yield re-enables the start button, while
+            # progress updates keep it disabled.
+            try:
+                for update in enforce_terms(terms_accepted, *args):
+                    status = update[0] if isinstance(update, tuple) else update
+                    if (
+                        isinstance(update, tuple)
+                        and len(update) > 1
+                        and update[1] is interactive_true
+                    ):
+                        gr.Warning(status)
+                    yield update
+            except Exception:
+                gr.Warning(
+                    i18n(
+                        "An error occurred during real-time conversion. Please check the console logs for more details."
+                    )
+                )
+                raise
 
         def update_on_model_change(model_path):
             new_index = match_index(model_path)
@@ -1661,7 +1493,7 @@ def realtime_tab():
             )
 
             return gr.update(
-                choices=new_index_choices, value=safe_index_value
+                choices=path_choices(new_index_choices), value=safe_index_value
             ), gr.update(choices=new_sids, value=0 if new_sids else None)
 
         def refresh_devices():
@@ -1736,12 +1568,6 @@ def realtime_tab():
             outputs=[proposed_pitch_threshold],
         )
 
-        clean_audio.change(
-            fn=toggle_visible,
-            inputs=[clean_audio],
-            outputs=[clean_strength],
-        )
-
         embedder_model.change(
             fn=toggle_visible_embedder_custom,
             inputs=[embedder_model],
@@ -1754,7 +1580,7 @@ def realtime_tab():
             outputs=[],
         )
         refresh_embedders_button.click(
-            fn=lambda: gr.update(choices=refresh_embedders_folders()),
+            fn=lambda: gr.update(choices=path_choices(refresh_embedders_folders())),
             inputs=[],
             outputs=[embedder_model_custom],
         )
@@ -1762,114 +1588,90 @@ def realtime_tab():
         def update_visibility(checkbox, count):
             return [gr.update(visible=checkbox) for _ in range(count)]
 
-        def post_process_visible(checkbox):
-            return update_visibility(checkbox, 10)
 
-        def reverb_visible(checkbox):
-            return update_visibility(checkbox, 6)
-
-        def limiter_visible(checkbox):
+        def formant_visible(checkbox):
             return update_visibility(checkbox, 2)
 
-        def chorus_visible(checkbox):
-            return update_visibility(checkbox, 6)
-
-        def compress_visible(checkbox):
-            return update_visibility(checkbox, 4)
-
-        def delay_visible(checkbox):
-            return update_visibility(checkbox, 3)
-
-        post_process.change(
-            fn=post_process_visible,
-            inputs=[post_process],
-            outputs=[
-                reverb,
-                pitch_shift,
-                limiter,
-                gain,
-                distortion,
-                chorus,
-                bitcrush,
-                clipping,
-                compressor,
-                delay,
-            ],
+        formant_shifting.change(
+            fn=formant_visible,
+            inputs=[formant_shifting],
+            outputs=[formant_qfrency, formant_timbre],
         )
 
-        reverb.change(
-            fn=reverb_visible,
-            inputs=[reverb],
-            outputs=[
-                reverb_room_size,
-                reverb_damping,
-                reverb_wet_gain,
-                reverb_dry_gain,
-                reverb_width,
-                reverb_freeze_mode,
-            ],
-        )
-        pitch_shift.change(
-            fn=toggle_visible,
-            inputs=[pitch_shift],
-            outputs=[pitch_shift_semitones],
-        )
-        limiter.change(
-            fn=limiter_visible,
-            inputs=[limiter],
-            outputs=[limiter_threshold, limiter_release_time],
-        )
-        gain.change(
-            fn=toggle_visible,
-            inputs=[gain],
-            outputs=[gain_db],
-        )
-        distortion.change(
-            fn=toggle_visible,
-            inputs=[distortion],
-            outputs=[distortion_gain],
-        )
-        chorus.change(
-            fn=chorus_visible,
-            inputs=[chorus],
-            outputs=[
-                chorus_rate,
-                chorus_depth,
-                chorus_center_delay,
-                chorus_feedback,
-                chorus_mix,
-            ],
-        )
-        bitcrush.change(
-            fn=toggle_visible,
-            inputs=[bitcrush],
-            outputs=[bitcrush_bit_depth],
-        )
-        clipping.change(
-            fn=toggle_visible,
-            inputs=[clipping],
-            outputs=[clipping_threshold],
-        )
-        compressor.change(
-            fn=compress_visible,
-            inputs=[compressor],
-            outputs=[
-                compressor_threshold,
-                compressor_ratio,
-                compressor_attack,
-                compressor_release,
-            ],
-        )
-        delay.change(
-            fn=delay_visible,
-            inputs=[delay],
-            outputs=[delay_seconds, delay_feedback, delay_mix],
-        )
 
         if client_mode:
+
+            def client_start_handler(
+                input_device,
+                input_gain,
+                output_device,
+                output_gain,
+                monitor_device,
+                monitor_gain,
+                use_monitor,
+                vad,
+                chunk,
+                cross_fade,
+                extra_convert,
+                silent_thresh,
+                pitch_val,
+                index_r,
+                vol_env,
+                prot,
+                model,
+                index,
+                terms,
+            ):
+                save_realtime_settings(
+                    input_device=input_device,
+                    output_device=output_device,
+                    monitor_device=monitor_device,
+                    model_file=model,
+                    index_file=index,
+                    use_monitor_device=use_monitor,
+                    input_audio_gain=int(input_gain) if input_gain is not None else 100,
+                    output_audio_gain=(
+                        int(output_gain) if output_gain is not None else 100
+                    ),
+                    monitor_audio_gain=(
+                        int(monitor_gain) if monitor_gain is not None else 100
+                    ),
+                    vad_enabled=vad,
+                    chunk_size=chunk,
+                    cross_fade_overlap_size=cross_fade,
+                    extra_convert_size=extra_convert,
+                    silent_threshold=silent_thresh,
+                    pitch=pitch_val,
+                    index_rate=index_r,
+                    volume_envelope=vol_env,
+                    protect=prot,
+                    terms_accepted=terms,
+                )
+                return [interactive_false, interactive_visible]
+
             start_button.click(
-                fn=lambda: [interactive_false, interactive_visible],
-                inputs=[],
+                fn=client_start_handler,
+                inputs=[
+                    input_audio_device,
+                    input_audio_gain,
+                    output_audio_device,
+                    output_audio_gain,
+                    monitor_output_device,
+                    monitor_audio_gain,
+                    use_monitor_device,
+                    vad_enabled,
+                    chunk_size,
+                    cross_fade_overlap_size,
+                    extra_convert_size,
+                    silent_threshold,
+                    pitch,
+                    index_rate,
+                    volume_envelope,
+                    protect,
+                    model_file,
+                    index_file,
+                    terms_checkbox,
+                ],
                 outputs=[start_button, stop_button],
             )
 
@@ -1905,44 +1707,9 @@ def realtime_tab():
                     embedder_model,
                     embedder_model_custom,
                     exclusive_mode,
-                    clean_audio,
-                    clean_strength,
-                    post_process,
-                    reverb,
-                    pitch_shift,
-                    limiter,
-                    gain,
-                    distortion,
-                    chorus,
-                    bitcrush,
-                    clipping,
-                    compressor,
-                    delay,
-                    reverb_room_size,
-                    reverb_damping,
-                    reverb_wet_gain,
-                    reverb_dry_gain,
-                    reverb_width,
-                    reverb_freeze_mode,
-                    pitch_shift_semitones,
-                    limiter_threshold,
-                    limiter_release_time,
-                    gain_db,
-                    distortion_gain,
-                    chorus_rate,
-                    chorus_depth,
-                    chorus_center_delay,
-                    chorus_feedback,
-                    chorus_mix,
-                    bitcrush_bit_depth,
-                    clipping_threshold,
-                    compressor_threshold,
-                    compressor_ratio,
-                    compressor_attack,
-                    compressor_release,
-                    delay_seconds,
-                    delay_feedback,
-                    delay_mix,
+                    formant_shifting,
+                    formant_qfrency,
+                    formant_timbre,
                 ],
                 outputs=[json_button_hidden],
             )
@@ -1959,7 +1726,7 @@ def realtime_tab():
             )
         else:
             start_button.click(
-                fn=enforce_terms,
+                fn=_realtime_with_toast,
                 inputs=[
                     terms_checkbox,
                     input_audio_device,
@@ -1993,44 +1760,9 @@ def realtime_tab():
                     proposed_pitch_threshold,
                     embedder_model,
                     embedder_model_custom,
-                    clean_audio,
-                    clean_strength,
-                    post_process,
-                    reverb,
-                    pitch_shift,
-                    limiter,
-                    gain,
-                    distortion,
-                    chorus,
-                    bitcrush,
-                    clipping,
-                    compressor,
-                    delay,
-                    reverb_room_size,
-                    reverb_damping,
-                    reverb_wet_gain,
-                    reverb_dry_gain,
-                    reverb_width,
-                    reverb_freeze_mode,
-                    pitch_shift_semitones,
-                    limiter_threshold,
-                    limiter_release_time,
-                    gain_db,
-                    distortion_gain,
-                    chorus_rate,
-                    chorus_depth,
-                    chorus_center_delay,
-                    chorus_feedback,
-                    chorus_mix,
-                    bitcrush_bit_depth,
-                    clipping_threshold,
-                    compressor_threshold,
-                    compressor_ratio,
-                    compressor_attack,
-                    compressor_release,
-                    delay_seconds,
-                    delay_feedback,
-                    delay_mix,
+                    formant_shifting,
+                    formant_qfrency,
+                    formant_timbre,
                 ],
                 outputs=[latency_info, start_button, stop_button],
             )
@@ -2066,6 +1798,12 @@ def realtime_tab():
         )
 
         # Add event handlers to save settings
+        terms_checkbox.change(
+            fn=lambda val: save_realtime_settings(terms_accepted=val),
+            inputs=[terms_checkbox],
+            outputs=[],
+        )
+
         input_audio_device.change(
             fn=save_realtime_settings,
             inputs=[
@@ -2132,8 +1870,12 @@ def realtime_tab():
                 new_names = get_files("model")
                 new_indexes = sorted(get_files("index"))
                 return (
-                    gr.update(choices=sorted(new_names, key=extract_model_and_epoch)),
-                    gr.update(choices=new_indexes),
+                    gr.update(
+                        choices=path_choices(
+                            sorted(new_names, key=extract_model_and_epoch)
+                        )
+                    ),
+                    gr.update(choices=path_choices(new_indexes)),
                 )
 
             refresh_button.click(
@@ -2153,8 +1895,12 @@ def realtime_tab():
                     output_choices.keys()
                 )
                 return (
-                    gr.update(choices=sorted(new_names, key=extract_model_and_epoch)),
-                    gr.update(choices=new_indexes),
+                    gr.update(
+                        choices=path_choices(
+                            sorted(new_names, key=extract_model_and_epoch)
+                        )
+                    ),
+                    gr.update(choices=path_choices(new_indexes)),
                     gr.update(choices=input_choices),
                     gr.update(choices=output_choices),
                     gr.update(choices=output_choices),
@@ -2341,7 +2087,7 @@ def realtime_tab():
             outputs=[],
         )
 
-        # chunk_size.change(fn=lambda value: change_config(int(value * AUDIO_SAMPLE_RATE / 1000 / 128) if not client_mode else None, "read_chunk_size"), inputs=[chunk_size], outputs=[])
+        # chunk_size.change(fn=lambda value: change_config(int(value * AUDIO_SAMPLE_RATE / 1000) if not client_mode else None, "block_frame"), inputs=[chunk_size], outputs=[])
 
         pitch.change(
             js=(
@@ -2456,582 +2202,46 @@ def realtime_tab():
             inputs=[proposed_pitch_threshold],
             outputs=[],
         )
-        clean_audio.change(
+        formant_shifting.change(
             js=(
-                "(value) => window.ChangeConfig(value, 'clean_audio')"
+                "(value) => window.ChangeConfig(value, 'formant_shifting')"
                 if client_mode
                 else None
             ),
             fn=(
-                (lambda value: change_config(value, "clean_audio"))
+                (lambda value: change_config(value, "formant_shifting"))
                 if not client_mode
                 else None
             ),
-            inputs=[clean_audio],
+            inputs=[formant_shifting],
             outputs=[],
         )
-        clean_strength.change(
+        formant_qfrency.change(
             js=(
-                "(value) => window.ChangeConfig(value, 'clean_strength')"
+                "(value) => window.ChangeConfig(value, 'formant_qfrency')"
                 if client_mode
                 else None
             ),
             fn=(
-                (lambda value: change_config(value, "clean_strength"))
+                (lambda value: change_config(value, "formant_qfrency"))
                 if not client_mode
                 else None
             ),
-            inputs=[clean_strength],
+            inputs=[formant_qfrency],
             outputs=[],
         )
-
-        post_process.change(
+        formant_timbre.change(
             js=(
-                "(value) => window.ChangeConfig(value, 'post_process')"
+                "(value) => window.ChangeConfig(value, 'formant_timbre')"
                 if client_mode
                 else None
             ),
             fn=(
-                (lambda value: change_config(value, "post_process"))
+                (lambda value: change_config(value, "formant_timbre"))
                 if not client_mode
                 else None
             ),
-            inputs=[post_process],
-            outputs=[],
-        )
-        reverb.change(
-            js=(
-                "(value) => window.ChangeConfig(value, 'reverb', if_kwargs=true)"
-                if client_mode
-                else None
-            ),
-            fn=(
-                (lambda value: change_config(value, "reverb", if_kwargs=True))
-                if not client_mode
-                else None
-            ),
-            inputs=[reverb],
-            outputs=[],
-        )
-        pitch_shift.change(
-            js=(
-                "(value) => window.ChangeConfig(value, 'pitch_shift', if_kwargs=true)"
-                if client_mode
-                else None
-            ),
-            fn=(
-                (lambda value: change_config(value, "pitch_shift", if_kwargs=True))
-                if not client_mode
-                else None
-            ),
-            inputs=[pitch_shift],
-            outputs=[],
-        )
-        limiter.change(
-            js=(
-                "(value) => window.ChangeConfig(value, 'limiter', if_kwargs=true)"
-                if client_mode
-                else None
-            ),
-            fn=(
-                (lambda value: change_config(value, "limiter", if_kwargs=True))
-                if not client_mode
-                else None
-            ),
-            inputs=[limiter],
-            outputs=[],
-        )
-        gain.change(
-            js=(
-                "(value) => window.ChangeConfig(value, 'gain', if_kwargs=true)"
-                if client_mode
-                else None
-            ),
-            fn=(
-                (lambda value: change_config(value, "gain", if_kwargs=True))
-                if not client_mode
-                else None
-            ),
-            inputs=[gain],
-            outputs=[],
-        )
-        distortion.change(
-            js=(
-                "(value) => window.ChangeConfig(value, 'distortion', if_kwargs=true)"
-                if client_mode
-                else None
-            ),
-            fn=(
-                (lambda value: change_config(value, "distortion", if_kwargs=True))
-                if not client_mode
-                else None
-            ),
-            inputs=[distortion],
-            outputs=[],
-        )
-        chorus.change(
-            js=(
-                "(value) => window.ChangeConfig(value, 'chorus', if_kwargs=true)"
-                if client_mode
-                else None
-            ),
-            fn=(
-                (lambda value: change_config(value, "chorus", if_kwargs=True))
-                if not client_mode
-                else None
-            ),
-            inputs=[chorus],
-            outputs=[],
-        )
-        bitcrush.change(
-            js=(
-                "(value) => window.ChangeConfig(value, 'bitcrush', if_kwargs=true)"
-                if client_mode
-                else None
-            ),
-            fn=(
-                (lambda value: change_config(value, "bitcrush", if_kwargs=True))
-                if not client_mode
-                else None
-            ),
-            inputs=[bitcrush],
-            outputs=[],
-        )
-        clipping.change(
-            js=(
-                "(value) => window.ChangeConfig(value, 'clipping', if_kwargs=true)"
-                if client_mode
-                else None
-            ),
-            fn=(
-                (lambda value: change_config(value, "clipping", if_kwargs=True))
-                if not client_mode
-                else None
-            ),
-            inputs=[clipping],
-            outputs=[],
-        )
-        compressor.change(
-            js=(
-                "(value) => window.ChangeConfig(value, 'compressor', if_kwargs=true)"
-                if client_mode
-                else None
-            ),
-            fn=(
-                (lambda value: change_config(value, "compressor", if_kwargs=True))
-                if not client_mode
-                else None
-            ),
-            inputs=[compressor],
-            outputs=[],
-        )
-        delay.change(
-            js=(
-                "(value) => window.ChangeConfig(value, 'delay', if_kwargs=true)"
-                if client_mode
-                else None
-            ),
-            fn=(
-                (lambda value: change_config(value, "delay", if_kwargs=True))
-                if not client_mode
-                else None
-            ),
-            inputs=[delay],
+            inputs=[formant_timbre],
             outputs=[],
         )
 
-        reverb_room_size.change(
-            js=(
-                "(value) => window.ChangeConfig(value, 'reverb_room_size', if_kwargs=true)"
-                if client_mode
-                else None
-            ),
-            fn=(
-                (lambda value: change_config(value, "reverb_room_size", if_kwargs=True))
-                if not client_mode
-                else None
-            ),
-            inputs=[reverb_room_size],
-            outputs=[],
-        )
-        reverb_damping.change(
-            js=(
-                "(value) => window.ChangeConfig(value, 'reverb_damping', if_kwargs=true)"
-                if client_mode
-                else None
-            ),
-            fn=(
-                (lambda value: change_config(value, "reverb_damping", if_kwargs=True))
-                if not client_mode
-                else None
-            ),
-            inputs=[reverb_damping],
-            outputs=[],
-        )
-        reverb_wet_gain.change(
-            js=(
-                "(value) => window.ChangeConfig(value, 'reverb_wet_gain', if_kwargs=true)"
-                if client_mode
-                else None
-            ),
-            fn=(
-                (lambda value: change_config(value, "reverb_wet_gain", if_kwargs=True))
-                if not client_mode
-                else None
-            ),
-            inputs=[reverb_wet_gain],
-            outputs=[],
-        )
-        reverb_dry_gain.change(
-            js=(
-                "(value) => window.ChangeConfig(value, 'reverb_dry_gain', if_kwargs=true)"
-                if client_mode
-                else None
-            ),
-            fn=(
-                (lambda value: change_config(value, "reverb_dry_gain", if_kwargs=True))
-                if not client_mode
-                else None
-            ),
-            inputs=[reverb_dry_gain],
-            outputs=[],
-        )
-        reverb_width.change(
-            js=(
-                "(value) => window.ChangeConfig(value, 'reverb_width', if_kwargs=true)"
-                if client_mode
-                else None
-            ),
-            fn=(
-                (lambda value: change_config(value, "reverb_width", if_kwargs=True))
-                if not client_mode
-                else None
-            ),
-            inputs=[reverb_width],
-            outputs=[],
-        )
-        reverb_freeze_mode.change(
-            js=(
-                "(value) => window.ChangeConfig(value, 'reverb_freeze_mode', if_kwargs=true)"
-                if client_mode
-                else None
-            ),
-            fn=(
-                (
-                    lambda value: change_config(
-                        value, "reverb_freeze_mode", if_kwargs=True
-                    )
-                )
-                if not client_mode
-                else None
-            ),
-            inputs=[reverb_freeze_mode],
-            outputs=[],
-        )
-
-        pitch_shift_semitones.change(
-            js=(
-                "(value) => window.ChangeConfig(value, 'pitch_shift_semitones', if_kwargs=true)"
-                if client_mode
-                else None
-            ),
-            fn=(
-                (
-                    lambda value: change_config(
-                        value, "pitch_shift_semitones", if_kwargs=True
-                    )
-                )
-                if not client_mode
-                else None
-            ),
-            inputs=[pitch_shift_semitones],
-            outputs=[],
-        )
-        limiter_threshold.change(
-            js=(
-                "(value) => window.ChangeConfig(value, 'limiter_threshold', if_kwargs=true)"
-                if client_mode
-                else None
-            ),
-            fn=(
-                (
-                    lambda value: change_config(
-                        value, "limiter_threshold", if_kwargs=True
-                    )
-                )
-                if not client_mode
-                else None
-            ),
-            inputs=[limiter_threshold],
-            outputs=[],
-        )
-        limiter_release_time.change(
-            js=(
-                "(value) => window.ChangeConfig(value, 'limiter_release_time', if_kwargs=true)"
-                if client_mode
-                else None
-            ),
-            fn=(
-                (
-                    lambda value: change_config(
-                        value, "limiter_release_time", if_kwargs=True
-                    )
-                )
-                if not client_mode
-                else None
-            ),
-            inputs=[limiter_release_time],
-            outputs=[],
-        )
-        gain_db.change(
-            js=(
-                "(value) => window.ChangeConfig(value, 'gain_db', if_kwargs=true)"
-                if client_mode
-                else None
-            ),
-            fn=(
-                (lambda value: change_config(value, "gain_db", if_kwargs=True))
-                if not client_mode
-                else None
-            ),
-            inputs=[gain_db],
-            outputs=[],
-        )
-        distortion_gain.change(
-            js=(
-                "(value) => window.ChangeConfig(value, 'distortion_gain', if_kwargs=true)"
-                if client_mode
-                else None
-            ),
-            fn=(
-                (lambda value: change_config(value, "distortion_gain", if_kwargs=True))
-                if not client_mode
-                else None
-            ),
-            inputs=[distortion_gain],
-            outputs=[],
-        )
-
-        chorus_rate.change(
-            js=(
-                "(value) => window.ChangeConfig(value, 'chorus_rate', if_kwargs=true)"
-                if client_mode
-                else None
-            ),
-            fn=(
-                (lambda value: change_config(value, "chorus_rate", if_kwargs=True))
-                if not client_mode
-                else None
-            ),
-            inputs=[chorus_rate],
-            outputs=[],
-        )
-        chorus_depth.change(
-            js=(
-                "(value) => window.ChangeConfig(value, 'chorus_depth', if_kwargs=true)"
-                if client_mode
-                else None
-            ),
-            fn=(
-                (lambda value: change_config(value, "chorus_depth", if_kwargs=True))
-                if not client_mode
-                else None
-            ),
-            inputs=[chorus_depth],
-            outputs=[],
-        )
-        chorus_center_delay.change(
-            js=(
-                "(value) => window.ChangeConfig(value, 'chorus_center_delay', if_kwargs=true)"
-                if client_mode
-                else None
-            ),
-            fn=(
-                (
-                    lambda value: change_config(
-                        value, "chorus_center_delay", if_kwargs=True
-                    )
-                )
-                if not client_mode
-                else None
-            ),
-            inputs=[chorus_center_delay],
-            outputs=[],
-        )
-        chorus_feedback.change(
-            js=(
-                "(value) => window.ChangeConfig(value, 'chorus_feedback', if_kwargs=true)"
-                if client_mode
-                else None
-            ),
-            fn=(
-                (lambda value: change_config(value, "chorus_feedback", if_kwargs=True))
-                if not client_mode
-                else None
-            ),
-            inputs=[chorus_feedback],
-            outputs=[],
-        )
-        chorus_mix.change(
-            js=(
-                "(value) => window.ChangeConfig(value, 'chorus_mix', if_kwargs=true)"
-                if client_mode
-                else None
-            ),
-            fn=(
-                (lambda value: change_config(value, "chorus_mix", if_kwargs=True))
-                if not client_mode
-                else None
-            ),
-            inputs=[chorus_mix],
-            outputs=[],
-        )
-
-        bitcrush_bit_depth.change(
-            js=(
-                "(value) => window.ChangeConfig(value, 'bitcrush_bit_depth', if_kwargs=true)"
-                if client_mode
-                else None
-            ),
-            fn=(
-                (
-                    lambda value: change_config(
-                        value, "bitcrush_bit_depth", if_kwargs=True
-                    )
-                )
-                if not client_mode
-                else None
-            ),
-            inputs=[bitcrush_bit_depth],
-            outputs=[],
-        )
-        clipping_threshold.change(
-            js=(
-                "(value) => window.ChangeConfig(value, 'clipping_threshold', if_kwargs=true)"
-                if client_mode
-                else None
-            ),
-            fn=(
-                (
-                    lambda value: change_config(
-                        value, "clipping_threshold", if_kwargs=True
-                    )
-                )
-                if not client_mode
-                else None
-            ),
-            inputs=[clipping_threshold],
-            outputs=[],
-        )
-
-        compressor_threshold.change(
-            js=(
-                "(value) => window.ChangeConfig(value, 'compressor_threshold', if_kwargs=true)"
-                if client_mode
-                else None
-            ),
-            fn=(
-                (
-                    lambda value: change_config(
-                        value, "compressor_threshold", if_kwargs=True
-                    )
-                )
-                if not client_mode
-                else None
-            ),
-            inputs=[compressor_threshold],
-            outputs=[],
-        )
-        compressor_ratio.change(
-            js=(
-                "(value) => window.ChangeConfig(value, 'compressor_ratio', if_kwargs=true)"
-                if client_mode
-                else None
-            ),
-            fn=(
-                (lambda value: change_config(value, "compressor_ratio", if_kwargs=True))
-                if not client_mode
-                else None
-            ),
-            inputs=[compressor_ratio],
-            outputs=[],
-        )
-        compressor_attack.change(
-            js=(
-                "(value) => window.ChangeConfig(value, 'compressor_attack', if_kwargs=true)"
-                if client_mode
-                else None
-            ),
-            fn=(
-                (
-                    lambda value: change_config(
-                        value, "compressor_attack", if_kwargs=True
-                    )
-                )
-                if not client_mode
-                else None
-            ),
-            inputs=[compressor_attack],
-            outputs=[],
-        )
-        compressor_release.change(
-            js=(
-                "(value) => window.ChangeConfig(value, 'compressor_release', if_kwargs=true)"
-                if client_mode
-                else None
-            ),
-            fn=(
-                (
-                    lambda value: change_config(
-                        value, "compressor_release", if_kwargs=True
-                    )
-                )
-                if not client_mode
-                else None
-            ),
-            inputs=[compressor_release],
-            outputs=[],
-        )
-
-        delay_seconds.change(
-            js=(
-                "(value) => window.ChangeConfig(value, 'delay_seconds', if_kwargs=true)"
-                if client_mode
-                else None
-            ),
-            fn=(
-                (lambda value: change_config(value, "delay_seconds", if_kwargs=True))
-                if not client_mode
-                else None
-            ),
-            inputs=[delay_seconds],
-            outputs=[],
-        )
-        delay_feedback.change(
-            js=(
-                "(value) => window.ChangeConfig(value, 'delay_feedback', if_kwargs=true)"
-                if client_mode
-                else None
-            ),
-            fn=(
-                (lambda value: change_config(value, "delay_feedback", if_kwargs=True))
-                if not client_mode
-                else None
-            ),
-            inputs=[delay_feedback],
-            outputs=[],
-        )
-        delay_mix.change(
-            js=(
-                "(value) => window.ChangeConfig(value, 'delay_mix', if_kwargs=true)"
-                if client_mode
-                else None
-            ),
-            fn=(
-                (lambda value: change_config(value, "delay_mix", if_kwargs=True))
-                if not client_mode
-                else None
-            ),
-            inputs=[delay_mix],
-            outputs=[],
-        )

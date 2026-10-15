@@ -20,6 +20,7 @@ from tabs.inference.inference import (
     get_files,
     get_speakers_id,
     match_index,
+    path_choices,
     refresh_embedders_folders,
     update_filter_visibility,
 )
@@ -40,10 +41,10 @@ def process_input(file_path):
     try:
         with open(file_path, "r", encoding="utf-8") as file:
             file.read()
-        gr.Info(f"The file has been loaded!")
+        gr.Info(i18n("The file has been loaded!"))
         return file_path, file_path
     except UnicodeDecodeError:
-        gr.Info(f"The file has to be in UTF-8 encoding.")
+        gr.Info(i18n("The file has to be in UTF-8 encoding."))
         return None, None
 
 
@@ -51,11 +52,14 @@ def process_input(file_path):
 def tts_tab():
     trigger = get_filter_trigger()
     with gr.Column():
+        gr.Markdown(value=i18n("## Model Selection"))
         with gr.Row():
             model_file = gr.Dropdown(
                 label=i18n("Voice Model"),
                 info=i18n("Select the voice model to use for the conversion."),
-                choices=sorted(get_files("model"), key=extract_model_and_epoch),
+                choices=path_choices(
+                    sorted(get_files("model"), key=extract_model_and_epoch)
+                ),
                 interactive=True,
                 value=default_weight,
                 allow_custom_value=True,
@@ -72,7 +76,7 @@ def tts_tab():
             index_file = gr.Dropdown(
                 label=i18n("Index File"),
                 info=i18n("Select the index file to use for the conversion."),
-                choices=sorted(get_files("index")),
+                choices=path_choices(sorted(get_files("index"))),
                 value=match_index(default_weight),
                 interactive=True,
                 allow_custom_value=True,
@@ -90,7 +94,7 @@ def tts_tab():
             )
         with gr.Row():
             unload_button = gr.Button(i18n("Unload Voice"))
-            refresh_button = gr.Button(i18n("Refresh"))
+            refresh_button = gr.Button(i18n("Refresh models and indexes"))
 
             unload_button.click(
                 fn=lambda: (
@@ -107,6 +111,7 @@ def tts_tab():
                 outputs=[index_file],
             )
 
+    gr.Markdown(value=i18n("## TTS Settings"))
     gr.Markdown(
         i18n(
             f"Applio is a Speech-to-Speech conversion software, utilizing EdgeTTS as middleware for running the Text-to-Speech (TTS) component. Read more about it [here!](https://docs.applio.org/applio/getting-started/tts)"
@@ -229,24 +234,33 @@ def tts_tab():
                 value=155.0,
                 interactive=True,
             )
-            clean_audio = gr.Checkbox(
-                label=i18n("Clean Audio"),
+            formant_shifting = gr.Checkbox(
+                label=i18n("Formant Shifting"),
                 info=i18n(
-                    "Clean your audio output using noise detection algorithms, recommended for speaking audios."
+                    "Enable formant shifting. Used for male to female and vice-versa convertions."
                 ),
                 visible=True,
                 value=False,
                 interactive=True,
             )
-            clean_strength = gr.Slider(
+            formant_qfrency = gr.Slider(
                 minimum=0,
-                maximum=1,
-                label=i18n("Clean Strength"),
-                info=i18n(
-                    "Set the clean-up level to the audio you want, the more you increase it the more it will clean up, but it is possible that the audio will be more compressed."
-                ),
-                visible=True,
-                value=0.5,
+                maximum=16,
+                step=0.1,
+                label=i18n("Quefrency for formant shifting"),
+                info=i18n("Modifies formants width and spectral envelope."),
+                visible=False,
+                value=1.0,
+                interactive=True,
+            )
+            formant_timbre = gr.Slider(
+                minimum=0,
+                maximum=16,
+                step=0.1,
+                label=i18n("Timbre for formant shifting"),
+                info=i18n("Adjusts vocal tract length / timbre brightness."),
+                visible=False,
+                value=1.0,
                 interactive=True,
             )
             pitch = gr.Slider(
@@ -297,7 +311,6 @@ def tts_tab():
                 ),
                 choices=[
                     "crepe",
-                    "crepe-tiny",
                     "rmvpe",
                     "fcpe",
                 ],
@@ -324,7 +337,7 @@ def tts_tab():
                     with gr.Row():
                         embedder_model_custom = gr.Dropdown(
                             label=i18n("Select Custom Embedder"),
-                            choices=refresh_embedders_folders(),
+                            choices=path_choices(refresh_embedders_folders()),
                             interactive=True,
                             allow_custom_value=True,
                         )
@@ -355,17 +368,29 @@ def tts_tab():
 
     def enforce_terms(terms_accepted, *args):
         if not terms_accepted:
-            message = "You must agree to the Terms of Use to proceed."
+            message = i18n("You must agree to the Terms of Use to proceed.")
             gr.Info(message)
             return message, None
         try:
-            return run_tts_script(*args)
+            gr.Info(i18n("Starting text-to-speech..."))
+            result = run_tts_script(*args)
+            gr.Info(result[0])
+            return result
         except Exception:
             traceback.print_exc()
+            gr.Warning(
+                i18n(
+                    "An error occurred during TTS conversion. Please check the console logs for more details."
+                )
+            )
             return (
-                "An error occurred during TTS conversion. Please check the console logs for more details.",
+                i18n(
+                    "An error occurred during TTS conversion. Please check the console logs for more details."
+                ),
                 None,
             )
+
+    gr.Markdown(value=i18n("## Conversion"))
 
     terms_checkbox = gr.Checkbox(
         label=i18n("I agree to the terms of use"),
@@ -379,13 +404,19 @@ def tts_tab():
 
     with gr.Row():
         vc_output1 = gr.Textbox(
-            label=i18n("Output Information"),
+            label=i18n("TTS output"),
             info=i18n("The output information will be displayed here."),
         )
         vc_output2 = gr.Audio(label=i18n("Export Audio"))
 
     def toggle_visible(checkbox):
         return {"visible": checkbox, "__type__": "update"}
+
+    def toggle_visible_formant(checkbox):
+        return [
+            {"visible": checkbox, "__type__": "update"},
+            {"visible": checkbox, "__type__": "update"},
+        ]
 
     def toggle_visible_embedder_custom(embedder_model):
         if embedder_model == "custom":
@@ -402,10 +433,10 @@ def tts_tab():
         inputs=[proposed_pitch],
         outputs=[proposed_pitch_threshold],
     )
-    clean_audio.change(
-        fn=toggle_visible,
-        inputs=[clean_audio],
-        outputs=[clean_strength],
+    formant_shifting.change(
+        fn=toggle_visible_formant,
+        inputs=[formant_shifting],
+        outputs=[formant_qfrency, formant_timbre],
     )
     refresh_button.click(
         fn=change_choices,
@@ -432,7 +463,7 @@ def tts_tab():
         outputs=[],
     )
     refresh_embedders_button.click(
-        fn=lambda: gr.update(choices=refresh_embedders_folders()),
+        fn=lambda: gr.update(choices=path_choices(refresh_embedders_folders())),
         inputs=[],
         outputs=[embedder_model_custom],
     )
@@ -458,12 +489,13 @@ def tts_tab():
             autotune_strength,
             proposed_pitch,
             proposed_pitch_threshold,
-            clean_audio,
-            clean_strength,
             export_format,
             embedder_model,
             embedder_model_custom,
             sid,
+            formant_shifting,
+            formant_qfrency,
+            formant_timbre,
         ],
         outputs=[vc_output1, vc_output2],
     )

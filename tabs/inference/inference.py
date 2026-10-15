@@ -95,7 +95,13 @@ def get_files(type="model"):
     best = {}
     order = 0
 
-    for root, _, files in os.walk(model_root_relative, followlinks=True):
+    for root, directories, files in os.walk(model_root_relative, followlinks=True):
+        directories[:] = [
+            name
+            for name in directories
+            if name.lower() != ".onnx-cache"
+            and not name.lower().startswith(".onnx-export-")
+        ]
         for file in files:
             if not file.endswith(exts):
                 continue
@@ -120,6 +126,30 @@ def get_files(type="model"):
             order += 1
 
     return [t[2] for t in sorted(best.values(), key=lambda x: x[1])]
+
+
+def display_name(path):
+    """Dropdown label for a path: the file or folder name, without extension."""
+    return os.path.splitext(os.path.basename(path))[0]
+
+
+def path_choices(paths):
+    """
+    Convert a list of paths into (label, value) dropdown choices so only the
+    file name is displayed and announced instead of the full relative path.
+    The order of `paths` is preserved, and duplicate names are disambiguated
+    by appending the parent folder name.
+    """
+    names = [display_name(path) for path in paths]
+    counts = {}
+    for name in names:
+        counts[name] = counts.get(name, 0) + 1
+    choices = []
+    for name, path in zip(names, paths):
+        if counts[name] > 1:
+            name = f"{name} ({os.path.basename(os.path.dirname(path))})"
+        choices.append((name, path))
+    return choices
 
 
 default_weight = next(iter(get_files("model")), None)
@@ -242,9 +272,9 @@ def change_choices(model):
     ]
 
     return (
-        {"choices": models_list, "__type__": "update"},
-        {"choices": indexes_list, "__type__": "update"},
-        {"choices": sorted(audio_paths), "__type__": "update"},
+        {"choices": path_choices(models_list), "__type__": "update"},
+        {"choices": path_choices(indexes_list), "__type__": "update"},
+        {"choices": path_choices(sorted(audio_paths)), "__type__": "update"},
         {
             "choices": (
                 sorted(speakers)
@@ -298,7 +328,7 @@ def save_to_wav2(upload_audio):
 
 
 def delete_outputs():
-    gr.Info(f"Outputs cleared!")
+    gr.Info(i18n("Outputs cleared!"))
     for root, _, files in os.walk(audio_root_relative, topdown=False):
         for name in files:
             if name.endswith(tuple(sup_audioext)) and name.__contains__("_output"):
@@ -484,7 +514,10 @@ def filter_dropdowns(filter_text):
     all_indexes = sorted(get_files("index"))
     filtered_models = [m for m in all_models if ft in m.lower()]
     filtered_indexes = [i for i in all_indexes if ft in i.lower()]
-    return (gr.update(choices=filtered_models), gr.update(choices=filtered_indexes))
+    return (
+        gr.update(choices=path_choices(filtered_models)),
+        gr.update(choices=path_choices(filtered_indexes)),
+    )
 
 
 def update_filter_visibility(_):
@@ -500,11 +533,14 @@ def update_filter_visibility(_):
 def inference_tab():
     trigger = get_filter_trigger()
     with gr.Column():
+        gr.Markdown(value=i18n("## Model Selection"))
         with gr.Row():
             model_file = gr.Dropdown(
                 label=i18n("Voice Model"),
                 info=i18n("Select the voice model to use for the conversion."),
-                choices=sorted(get_files("model"), key=extract_model_and_epoch),
+                choices=path_choices(
+                    sorted(get_files("model"), key=extract_model_and_epoch)
+                ),
                 value=default_weight,
                 interactive=True,
                 allow_custom_value=True,
@@ -520,7 +556,7 @@ def inference_tab():
             index_file = gr.Dropdown(
                 label=i18n("Index File"),
                 info=i18n("Select the index file to use for the conversion."),
-                choices=sorted(get_files("index")),
+                choices=path_choices(sorted(get_files("index"))),
                 value=match_index(default_weight),
                 interactive=True,
                 allow_custom_value=True,
@@ -538,7 +574,7 @@ def inference_tab():
         )
         with gr.Row():
             unload_button = gr.Button(i18n("Unload Voice"))
-            refresh_button = gr.Button(i18n("Refresh"))
+            refresh_button = gr.Button(i18n("Refresh models and indexes"))
 
             unload_button.click(
                 fn=lambda: (
@@ -564,7 +600,7 @@ def inference_tab():
                 audio = gr.Dropdown(
                     label=i18n("Select Audio"),
                     info=i18n("Select the audio to convert."),
-                    choices=sorted(audio_paths),
+                    choices=path_choices(sorted(audio_paths)),
                     value=audio_paths[0] if audio_paths else "",
                     interactive=True,
                     allow_custom_value=True,
@@ -651,26 +687,6 @@ def inference_tab():
                     value=155.0,
                     interactive=True,
                 )
-                clean_audio = gr.Checkbox(
-                    label=i18n("Clean Audio"),
-                    info=i18n(
-                        "Clean your audio output using noise detection algorithms, recommended for speaking audios."
-                    ),
-                    visible=True,
-                    value=False,
-                    interactive=True,
-                )
-                clean_strength = gr.Slider(
-                    minimum=0,
-                    maximum=1,
-                    label=i18n("Clean Strength"),
-                    info=i18n(
-                        "Set the clean-up level to the audio you want, the more you increase it the more it will clean up, but it is possible that the audio will be more compressed."
-                    ),
-                    visible=False,
-                    value=0.5,
-                    interactive=True,
-                )
                 formant_shifting = gr.Checkbox(
                     label=i18n("Formant Shifting"),
                     info=i18n(
@@ -678,12 +694,6 @@ def inference_tab():
                     ),
                     value=False,
                     visible=True,
-                    interactive=True,
-                )
-                post_process = gr.Checkbox(
-                    label=i18n("Post-Process"),
-                    info=i18n("Post-process the audio to apply effects to the output."),
-                    value=False,
                     interactive=True,
                 )
                 with gr.Row(visible=False) as formant_row:
@@ -697,7 +707,7 @@ def inference_tab():
                         interactive=True,
                     )
                     formant_refresh_button = gr.Button(
-                        value=i18n("Refresh"),
+                        value=i18n("Refresh formant presets"),
                         visible=False,
                     )
                 formant_qfrency = gr.Slider(
@@ -719,301 +729,6 @@ def inference_tab():
                     step=0.1,
                     visible=False,
                     interactive=True,
-                )
-                reverb = gr.Checkbox(
-                    label=i18n("Reverb"),
-                    info=i18n("Apply reverb to the audio."),
-                    value=False,
-                    interactive=True,
-                    visible=False,
-                )
-                reverb_room_size = gr.Slider(
-                    minimum=0,
-                    maximum=1,
-                    label=i18n("Reverb Room Size"),
-                    info=i18n("Set the room size of the reverb."),
-                    value=0.5,
-                    interactive=True,
-                    visible=False,
-                )
-                reverb_damping = gr.Slider(
-                    minimum=0,
-                    maximum=1,
-                    label=i18n("Reverb Damping"),
-                    info=i18n("Set the damping of the reverb."),
-                    value=0.5,
-                    interactive=True,
-                    visible=False,
-                )
-                reverb_wet_gain = gr.Slider(
-                    minimum=0,
-                    maximum=1,
-                    label=i18n("Reverb Wet Gain"),
-                    info=i18n("Set the wet gain of the reverb."),
-                    value=0.33,
-                    interactive=True,
-                    visible=False,
-                )
-                reverb_dry_gain = gr.Slider(
-                    minimum=0,
-                    maximum=1,
-                    label=i18n("Reverb Dry Gain"),
-                    info=i18n("Set the dry gain of the reverb."),
-                    value=0.4,
-                    interactive=True,
-                    visible=False,
-                )
-                reverb_width = gr.Slider(
-                    minimum=0,
-                    maximum=1,
-                    label=i18n("Reverb Width"),
-                    info=i18n("Set the width of the reverb."),
-                    value=1.0,
-                    interactive=True,
-                    visible=False,
-                )
-                reverb_freeze_mode = gr.Slider(
-                    minimum=0,
-                    maximum=1,
-                    label=i18n("Reverb Freeze Mode"),
-                    info=i18n("Set the freeze mode of the reverb."),
-                    value=0.0,
-                    interactive=True,
-                    visible=False,
-                )
-                pitch_shift = gr.Checkbox(
-                    label=i18n("Pitch Shift"),
-                    info=i18n("Apply pitch shift to the audio."),
-                    value=False,
-                    interactive=True,
-                    visible=False,
-                )
-                pitch_shift_semitones = gr.Slider(
-                    minimum=-12,
-                    maximum=12,
-                    label=i18n("Pitch Shift Semitones"),
-                    info=i18n("Set the pitch shift semitones."),
-                    value=0,
-                    interactive=True,
-                    visible=False,
-                )
-                limiter = gr.Checkbox(
-                    label=i18n("Limiter"),
-                    info=i18n("Apply limiter to the audio."),
-                    value=False,
-                    interactive=True,
-                    visible=False,
-                )
-                limiter_threshold = gr.Slider(
-                    minimum=-60,
-                    maximum=0,
-                    label=i18n("Limiter Threshold dB"),
-                    info=i18n("Set the limiter threshold dB."),
-                    value=-6,
-                    interactive=True,
-                    visible=False,
-                )
-                limiter_release_time = gr.Slider(
-                    minimum=0.01,
-                    maximum=1,
-                    label=i18n("Limiter Release Time"),
-                    info=i18n("Set the limiter release time."),
-                    value=0.05,
-                    interactive=True,
-                    visible=False,
-                )
-                gain = gr.Checkbox(
-                    label=i18n("Gain"),
-                    info=i18n("Apply gain to the audio."),
-                    value=False,
-                    interactive=True,
-                    visible=False,
-                )
-                gain_db = gr.Slider(
-                    minimum=-60,
-                    maximum=60,
-                    label=i18n("Gain dB"),
-                    info=i18n("Set the gain dB."),
-                    value=0,
-                    interactive=True,
-                    visible=False,
-                )
-                distortion = gr.Checkbox(
-                    label=i18n("Distortion"),
-                    info=i18n("Apply distortion to the audio."),
-                    value=False,
-                    interactive=True,
-                    visible=False,
-                )
-                distortion_gain = gr.Slider(
-                    minimum=-60,
-                    maximum=60,
-                    label=i18n("Distortion Gain"),
-                    info=i18n("Set the distortion gain."),
-                    value=25,
-                    interactive=True,
-                    visible=False,
-                )
-                chorus = gr.Checkbox(
-                    label=i18n("Chorus"),
-                    info=i18n("Apply chorus to the audio."),
-                    value=False,
-                    interactive=True,
-                    visible=False,
-                )
-                chorus_rate = gr.Slider(
-                    minimum=0,
-                    maximum=100,
-                    label=i18n("Chorus Rate Hz"),
-                    info=i18n("Set the chorus rate Hz."),
-                    value=1.0,
-                    interactive=True,
-                    visible=False,
-                )
-                chorus_depth = gr.Slider(
-                    minimum=0,
-                    maximum=1,
-                    label=i18n("Chorus Depth"),
-                    info=i18n("Set the chorus depth."),
-                    value=0.25,
-                    interactive=True,
-                    visible=False,
-                )
-                chorus_center_delay = gr.Slider(
-                    minimum=7,
-                    maximum=8,
-                    label=i18n("Chorus Center Delay ms"),
-                    info=i18n("Set the chorus center delay ms."),
-                    value=7,
-                    interactive=True,
-                    visible=False,
-                )
-                chorus_feedback = gr.Slider(
-                    minimum=0,
-                    maximum=1,
-                    label=i18n("Chorus Feedback"),
-                    info=i18n("Set the chorus feedback."),
-                    value=0.0,
-                    interactive=True,
-                    visible=False,
-                )
-                chorus_mix = gr.Slider(
-                    minimum=0,
-                    maximum=1,
-                    label=i18n("Chorus Mix"),
-                    info=i18n("Set the chorus mix."),
-                    value=0.5,
-                    interactive=True,
-                    visible=False,
-                )
-                bitcrush = gr.Checkbox(
-                    label=i18n("Bitcrush"),
-                    info=i18n("Apply bitcrush to the audio."),
-                    value=False,
-                    interactive=True,
-                    visible=False,
-                )
-                bitcrush_bit_depth = gr.Slider(
-                    minimum=1,
-                    maximum=32,
-                    label=i18n("Bitcrush Bit Depth"),
-                    info=i18n("Set the bitcrush bit depth."),
-                    value=8,
-                    interactive=True,
-                    visible=False,
-                )
-                clipping = gr.Checkbox(
-                    label=i18n("Clipping"),
-                    info=i18n("Apply clipping to the audio."),
-                    value=False,
-                    interactive=True,
-                    visible=False,
-                )
-                clipping_threshold = gr.Slider(
-                    minimum=-60,
-                    maximum=0,
-                    label=i18n("Clipping Threshold"),
-                    info=i18n("Set the clipping threshold."),
-                    value=-6,
-                    interactive=True,
-                    visible=False,
-                )
-                compressor = gr.Checkbox(
-                    label=i18n("Compressor"),
-                    info=i18n("Apply compressor to the audio."),
-                    value=False,
-                    interactive=True,
-                    visible=False,
-                )
-                compressor_threshold = gr.Slider(
-                    minimum=-60,
-                    maximum=0,
-                    label=i18n("Compressor Threshold dB"),
-                    info=i18n("Set the compressor threshold dB."),
-                    value=0,
-                    interactive=True,
-                    visible=False,
-                )
-                compressor_ratio = gr.Slider(
-                    minimum=1,
-                    maximum=20,
-                    label=i18n("Compressor Ratio"),
-                    info=i18n("Set the compressor ratio."),
-                    value=1,
-                    interactive=True,
-                    visible=False,
-                )
-                compressor_attack = gr.Slider(
-                    minimum=0.0,
-                    maximum=100,
-                    label=i18n("Compressor Attack ms"),
-                    info=i18n("Set the compressor attack ms."),
-                    value=1.0,
-                    interactive=True,
-                    visible=False,
-                )
-                compressor_release = gr.Slider(
-                    minimum=0.01,
-                    maximum=100,
-                    label=i18n("Compressor Release ms"),
-                    info=i18n("Set the compressor release ms."),
-                    value=100,
-                    interactive=True,
-                    visible=False,
-                )
-                delay = gr.Checkbox(
-                    label=i18n("Delay"),
-                    info=i18n("Apply delay to the audio."),
-                    value=False,
-                    interactive=True,
-                    visible=False,
-                )
-                delay_seconds = gr.Slider(
-                    minimum=0.0,
-                    maximum=5.0,
-                    label=i18n("Delay Seconds"),
-                    info=i18n("Set the delay seconds."),
-                    value=0.5,
-                    interactive=True,
-                    visible=False,
-                )
-                delay_feedback = gr.Slider(
-                    minimum=0.0,
-                    maximum=1.0,
-                    label=i18n("Delay Feedback"),
-                    info=i18n("Set the delay feedback."),
-                    value=0.0,
-                    interactive=True,
-                    visible=False,
-                )
-                delay_mix = gr.Slider(
-                    minimum=0.0,
-                    maximum=1.0,
-                    label=i18n("Delay Mix"),
-                    info=i18n("Set the delay mix."),
-                    value=0.5,
-                    interactive=True,
-                    visible=False,
                 )
                 with gr.Accordion(i18n("Preset Settings"), open=False):
                     with gr.Row():
@@ -1111,9 +826,9 @@ def inference_tab():
                     ),
                     choices=[
                         "crepe",
-                        "crepe-tiny",
                         "rmvpe",
                         "fcpe",
+                        "swift",
                     ],
                     value="rmvpe",
                     interactive=True,
@@ -1138,7 +853,7 @@ def inference_tab():
                         with gr.Row():
                             embedder_model_custom = gr.Dropdown(
                                 label=i18n("Select Custom Embedder"),
-                                choices=refresh_embedders_folders(),
+                                choices=path_choices(refresh_embedders_folders()),
                                 interactive=True,
                                 allow_custom_value=True,
                             )
@@ -1165,28 +880,42 @@ def inference_tab():
 
         def enforce_terms(terms_accepted, *args):
             if not terms_accepted:
-                message = "You must agree to the Terms of Use to proceed."
+                message = i18n("You must agree to the Terms of Use to proceed.")
                 gr.Info(message)
                 return message, None
             try:
-                return run_infer_script(*args)
+                gr.Info(i18n("Converting audio..."))
+                result = run_infer_script(*args)
+                gr.Info(result[0])
+                return result
             except Exception:
                 traceback.print_exc()
+                gr.Warning(
+                    i18n(
+                        "An error occurred during audio conversion. Please check the console logs for more details."
+                    )
+                )
                 return (
-                    "An error occurred during audio conversion. Please check the console logs for more details.",
+                    i18n(
+                        "An error occurred during audio conversion. Please check the console logs for more details."
+                    ),
                     None,
                 )
 
         def enforce_terms_batch(terms_accepted, *args):
             if not terms_accepted:
-                message = "You must agree to the Terms of Use to proceed."
+                message = i18n("You must agree to the Terms of Use to proceed.")
                 gr.Info(message)
                 return message
             try:
                 return run_batch_infer_script(*args)
             except Exception:
                 traceback.print_exc()
-                return "An error occurred during audio batch conversion. Please check the console logs for more details."
+                return i18n(
+                    "An error occurred during audio batch conversion. Please check the console logs for more details."
+                )
+
+        gr.Markdown(value=i18n("## Conversion"))
 
         terms_checkbox = gr.Checkbox(
             label=i18n("I agree to the terms of use"),
@@ -1201,7 +930,7 @@ def inference_tab():
 
         with gr.Row():
             vc_output1 = gr.Textbox(
-                label=i18n("Output Information"),
+                label=i18n("Conversion output"),
                 info=i18n("The output information will be displayed here."),
             )
             vc_output2 = gr.Audio(label=i18n("Export Audio"))
@@ -1294,26 +1023,6 @@ def inference_tab():
                     value=155.0,
                     interactive=True,
                 )
-                clean_audio_batch = gr.Checkbox(
-                    label=i18n("Clean Audio"),
-                    info=i18n(
-                        "Clean your audio output using noise detection algorithms, recommended for speaking audios."
-                    ),
-                    visible=True,
-                    value=False,
-                    interactive=True,
-                )
-                clean_strength_batch = gr.Slider(
-                    minimum=0,
-                    maximum=1,
-                    label=i18n("Clean Strength"),
-                    info=i18n(
-                        "Set the clean-up level to the audio you want, the more you increase it the more it will clean up, but it is possible that the audio will be more compressed."
-                    ),
-                    visible=False,
-                    value=0.5,
-                    interactive=True,
-                )
                 formant_shifting_batch = gr.Checkbox(
                     label=i18n("Formant Shifting"),
                     info=i18n(
@@ -1321,12 +1030,6 @@ def inference_tab():
                     ),
                     value=False,
                     visible=True,
-                    interactive=True,
-                )
-                post_process_batch = gr.Checkbox(
-                    label=i18n("Post-Process"),
-                    info=i18n("Post-process the audio to apply effects to the output."),
-                    value=False,
                     interactive=True,
                 )
                 with gr.Row(visible=False) as formant_row_batch:
@@ -1340,7 +1043,7 @@ def inference_tab():
                         interactive=True,
                     )
                     formant_refresh_button_batch = gr.Button(
-                        value=i18n("Refresh"),
+                        value=i18n("Refresh formant presets"),
                         visible=False,
                     )
                 formant_qfrency_batch = gr.Slider(
@@ -1362,301 +1065,6 @@ def inference_tab():
                     step=0.1,
                     visible=False,
                     interactive=True,
-                )
-                reverb_batch = gr.Checkbox(
-                    label=i18n("Reverb"),
-                    info=i18n("Apply reverb to the audio."),
-                    value=False,
-                    interactive=True,
-                    visible=False,
-                )
-                reverb_room_size_batch = gr.Slider(
-                    minimum=0,
-                    maximum=1,
-                    label=i18n("Reverb Room Size"),
-                    info=i18n("Set the room size of the reverb."),
-                    value=0.5,
-                    interactive=True,
-                    visible=False,
-                )
-                reverb_damping_batch = gr.Slider(
-                    minimum=0,
-                    maximum=1,
-                    label=i18n("Reverb Damping"),
-                    info=i18n("Set the damping of the reverb."),
-                    value=0.5,
-                    interactive=True,
-                    visible=False,
-                )
-                reverb_wet_gain_batch = gr.Slider(
-                    minimum=0,
-                    maximum=1,
-                    label=i18n("Reverb Wet Gain"),
-                    info=i18n("Set the wet gain of the reverb."),
-                    value=0.33,
-                    interactive=True,
-                    visible=False,
-                )
-                reverb_dry_gain_batch = gr.Slider(
-                    minimum=0,
-                    maximum=1,
-                    label=i18n("Reverb Dry Gain"),
-                    info=i18n("Set the dry gain of the reverb."),
-                    value=0.4,
-                    interactive=True,
-                    visible=False,
-                )
-                reverb_width_batch = gr.Slider(
-                    minimum=0,
-                    maximum=1,
-                    label=i18n("Reverb Width"),
-                    info=i18n("Set the width of the reverb."),
-                    value=1.0,
-                    interactive=True,
-                    visible=False,
-                )
-                reverb_freeze_mode_batch = gr.Slider(
-                    minimum=0,
-                    maximum=1,
-                    label=i18n("Reverb Freeze Mode"),
-                    info=i18n("Set the freeze mode of the reverb."),
-                    value=0.0,
-                    interactive=True,
-                    visible=False,
-                )
-                pitch_shift_batch = gr.Checkbox(
-                    label=i18n("Pitch Shift"),
-                    info=i18n("Apply pitch shift to the audio."),
-                    value=False,
-                    interactive=True,
-                    visible=False,
-                )
-                pitch_shift_semitones_batch = gr.Slider(
-                    minimum=-12,
-                    maximum=12,
-                    label=i18n("Pitch Shift Semitones"),
-                    info=i18n("Set the pitch shift semitones."),
-                    value=0,
-                    interactive=True,
-                    visible=False,
-                )
-                limiter_batch = gr.Checkbox(
-                    label=i18n("Limiter"),
-                    info=i18n("Apply limiter to the audio."),
-                    value=False,
-                    interactive=True,
-                    visible=False,
-                )
-                limiter_threshold_batch = gr.Slider(
-                    minimum=-60,
-                    maximum=0,
-                    label=i18n("Limiter Threshold dB"),
-                    info=i18n("Set the limiter threshold dB."),
-                    value=-6,
-                    interactive=True,
-                    visible=False,
-                )
-                limiter_release_time_batch = gr.Slider(
-                    minimum=0.01,
-                    maximum=1,
-                    label=i18n("Limiter Release Time"),
-                    info=i18n("Set the limiter release time."),
-                    value=0.05,
-                    interactive=True,
-                    visible=False,
-                )
-                gain_batch = gr.Checkbox(
-                    label=i18n("Gain"),
-                    info=i18n("Apply gain to the audio."),
-                    value=False,
-                    interactive=True,
-                    visible=False,
-                )
-                gain_db_batch = gr.Slider(
-                    minimum=-60,
-                    maximum=60,
-                    label=i18n("Gain dB"),
-                    info=i18n("Set the gain dB."),
-                    value=0,
-                    interactive=True,
-                    visible=False,
-                )
-                distortion_batch = gr.Checkbox(
-                    label=i18n("Distortion"),
-                    info=i18n("Apply distortion to the audio."),
-                    value=False,
-                    interactive=True,
-                    visible=False,
-                )
-                distortion_gain_batch = gr.Slider(
-                    minimum=-60,
-                    maximum=60,
-                    label=i18n("Distortion Gain"),
-                    info=i18n("Set the distortion gain."),
-                    value=25,
-                    interactive=True,
-                    visible=False,
-                )
-                chorus_batch = gr.Checkbox(
-                    label=i18n("Chorus"),
-                    info=i18n("Apply chorus to the audio."),
-                    value=False,
-                    interactive=True,
-                    visible=False,
-                )
-                chorus_rate_batch = gr.Slider(
-                    minimum=0,
-                    maximum=100,
-                    label=i18n("Chorus Rate Hz"),
-                    info=i18n("Set the chorus rate Hz."),
-                    value=1.0,
-                    interactive=True,
-                    visible=False,
-                )
-                chorus_depth_batch = gr.Slider(
-                    minimum=0,
-                    maximum=1,
-                    label=i18n("Chorus Depth"),
-                    info=i18n("Set the chorus depth."),
-                    value=0.25,
-                    interactive=True,
-                    visible=False,
-                )
-                chorus_center_delay_batch = gr.Slider(
-                    minimum=7,
-                    maximum=8,
-                    label=i18n("Chorus Center Delay ms"),
-                    info=i18n("Set the chorus center delay ms."),
-                    value=7,
-                    interactive=True,
-                    visible=False,
-                )
-                chorus_feedback_batch = gr.Slider(
-                    minimum=0,
-                    maximum=1,
-                    label=i18n("Chorus Feedback"),
-                    info=i18n("Set the chorus feedback."),
-                    value=0.0,
-                    interactive=True,
-                    visible=False,
-                )
-                chorus_mix_batch = gr.Slider(
-                    minimum=0,
-                    maximum=1,
-                    label=i18n("Chorus Mix"),
-                    info=i18n("Set the chorus mix."),
-                    value=0.5,
-                    interactive=True,
-                    visible=False,
-                )
-                bitcrush_batch = gr.Checkbox(
-                    label=i18n("Bitcrush"),
-                    info=i18n("Apply bitcrush to the audio."),
-                    value=False,
-                    interactive=True,
-                    visible=False,
-                )
-                bitcrush_bit_depth_batch = gr.Slider(
-                    minimum=1,
-                    maximum=32,
-                    label=i18n("Bitcrush Bit Depth"),
-                    info=i18n("Set the bitcrush bit depth."),
-                    value=8,
-                    interactive=True,
-                    visible=False,
-                )
-                clipping_batch = gr.Checkbox(
-                    label=i18n("Clipping"),
-                    info=i18n("Apply clipping to the audio."),
-                    value=False,
-                    interactive=True,
-                    visible=False,
-                )
-                clipping_threshold_batch = gr.Slider(
-                    minimum=-60,
-                    maximum=0,
-                    label=i18n("Clipping Threshold"),
-                    info=i18n("Set the clipping threshold."),
-                    value=-6,
-                    interactive=True,
-                    visible=False,
-                )
-                compressor_batch = gr.Checkbox(
-                    label=i18n("Compressor"),
-                    info=i18n("Apply compressor to the audio."),
-                    value=False,
-                    interactive=True,
-                    visible=False,
-                )
-                compressor_threshold_batch = gr.Slider(
-                    minimum=-60,
-                    maximum=0,
-                    label=i18n("Compressor Threshold dB"),
-                    info=i18n("Set the compressor threshold dB."),
-                    value=0,
-                    interactive=True,
-                    visible=False,
-                )
-                compressor_ratio_batch = gr.Slider(
-                    minimum=1,
-                    maximum=20,
-                    label=i18n("Compressor Ratio"),
-                    info=i18n("Set the compressor ratio."),
-                    value=1,
-                    interactive=True,
-                    visible=False,
-                )
-                compressor_attack_batch = gr.Slider(
-                    minimum=0.0,
-                    maximum=100,
-                    label=i18n("Compressor Attack ms"),
-                    info=i18n("Set the compressor attack ms."),
-                    value=1.0,
-                    interactive=True,
-                    visible=False,
-                )
-                compressor_release_batch = gr.Slider(
-                    minimum=0.01,
-                    maximum=100,
-                    label=i18n("Compressor Release ms"),
-                    info=i18n("Set the compressor release ms."),
-                    value=100,
-                    interactive=True,
-                    visible=False,
-                )
-                delay_batch = gr.Checkbox(
-                    label=i18n("Delay"),
-                    info=i18n("Apply delay to the audio."),
-                    value=False,
-                    interactive=True,
-                    visible=False,
-                )
-                delay_seconds_batch = gr.Slider(
-                    minimum=0.0,
-                    maximum=5.0,
-                    label=i18n("Delay Seconds"),
-                    info=i18n("Set the delay seconds."),
-                    value=0.5,
-                    interactive=True,
-                    visible=False,
-                )
-                delay_feedback_batch = gr.Slider(
-                    minimum=0.0,
-                    maximum=1.0,
-                    label=i18n("Delay Feedback"),
-                    info=i18n("Set the delay feedback."),
-                    value=0.0,
-                    interactive=True,
-                    visible=False,
-                )
-                delay_mix_batch = gr.Slider(
-                    minimum=0.0,
-                    maximum=1.0,
-                    label=i18n("Delay Mix"),
-                    info=i18n("Set the delay mix."),
-                    value=0.5,
-                    interactive=True,
-                    visible=False,
                 )
                 with gr.Accordion(i18n("Preset Settings"), open=False):
                     with gr.Row():
@@ -1756,9 +1164,9 @@ def inference_tab():
                     ),
                     choices=[
                         "crepe",
-                        "crepe-tiny",
                         "rmvpe",
                         "fcpe",
+                        "swift",
                     ],
                     value="rmvpe",
                     interactive=True,
@@ -1783,7 +1191,7 @@ def inference_tab():
                         with gr.Row():
                             embedder_model_custom_batch = gr.Dropdown(
                                 label=i18n("Select Custom Embedder"),
-                                choices=refresh_embedders_folders(),
+                                choices=path_choices(refresh_embedders_folders()),
                                 interactive=True,
                                 allow_custom_value=True,
                             )
@@ -1808,6 +1216,8 @@ def inference_tab():
                             i18n("Move files to custom embedder folder")
                         )
 
+        gr.Markdown(value=i18n("## Conversion"))
+
         terms_checkbox_batch = gr.Checkbox(
             label=i18n("I agree to the terms of use"),
             info=i18n(
@@ -1822,7 +1232,7 @@ def inference_tab():
 
         with gr.Row():
             vc_output3 = gr.Textbox(
-                label=i18n("Output Information"),
+                label=i18n("Batch conversion output"),
                 info=i18n("The output information will be displayed here."),
             )
 
@@ -1869,26 +1279,6 @@ def inference_tab():
                 gr.update(visible=False),
             )
 
-    def update_visibility(checkbox, count):
-        return [gr.update(visible=checkbox) for _ in range(count)]
-
-    def post_process_visible(checkbox):
-        return update_visibility(checkbox, 10)
-
-    def reverb_visible(checkbox):
-        return update_visibility(checkbox, 6)
-
-    def limiter_visible(checkbox):
-        return update_visibility(checkbox, 2)
-
-    def chorus_visible(checkbox):
-        return update_visibility(checkbox, 6)
-
-    def compress_visible(checkbox):
-        return update_visibility(checkbox, 4)
-
-    def delay_visible(checkbox):
-        return update_visibility(checkbox, 3)
 
     autotune.change(
         fn=toggle_visible,
@@ -1905,11 +1295,6 @@ def inference_tab():
         inputs=[proposed_pitch_batch],
         outputs=[proposed_pitch_threshold_batch],
     )
-    clean_audio.change(
-        fn=toggle_visible,
-        inputs=[clean_audio],
-        outputs=[clean_strength],
-    )
     formant_shifting.change(
         fn=toggle_visible_formant_shifting,
         inputs=[formant_shifting],
@@ -1923,7 +1308,7 @@ def inference_tab():
     )
     formant_shifting_batch.change(
         fn=toggle_visible_formant_shifting,
-        inputs=[formant_shifting],
+        inputs=[formant_shifting_batch],
         outputs=[
             formant_row_batch,
             formant_preset_batch,
@@ -1953,183 +1338,10 @@ def inference_tab():
             formant_timbre,
         ],
     )
-    post_process.change(
-        fn=post_process_visible,
-        inputs=[post_process],
-        outputs=[
-            reverb,
-            pitch_shift,
-            limiter,
-            gain,
-            distortion,
-            chorus,
-            bitcrush,
-            clipping,
-            compressor,
-            delay,
-        ],
-    )
-    reverb.change(
-        fn=reverb_visible,
-        inputs=[reverb],
-        outputs=[
-            reverb_room_size,
-            reverb_damping,
-            reverb_wet_gain,
-            reverb_dry_gain,
-            reverb_width,
-            reverb_freeze_mode,
-        ],
-    )
-    pitch_shift.change(
-        fn=toggle_visible,
-        inputs=[pitch_shift],
-        outputs=[pitch_shift_semitones],
-    )
-    limiter.change(
-        fn=limiter_visible,
-        inputs=[limiter],
-        outputs=[limiter_threshold, limiter_release_time],
-    )
-    gain.change(
-        fn=toggle_visible,
-        inputs=[gain],
-        outputs=[gain_db],
-    )
-    distortion.change(
-        fn=toggle_visible,
-        inputs=[distortion],
-        outputs=[distortion_gain],
-    )
-    chorus.change(
-        fn=chorus_visible,
-        inputs=[chorus],
-        outputs=[
-            chorus_rate,
-            chorus_depth,
-            chorus_center_delay,
-            chorus_feedback,
-            chorus_mix,
-        ],
-    )
-    bitcrush.change(
-        fn=toggle_visible,
-        inputs=[bitcrush],
-        outputs=[bitcrush_bit_depth],
-    )
-    clipping.change(
-        fn=toggle_visible,
-        inputs=[clipping],
-        outputs=[clipping_threshold],
-    )
-    compressor.change(
-        fn=compress_visible,
-        inputs=[compressor],
-        outputs=[
-            compressor_threshold,
-            compressor_ratio,
-            compressor_attack,
-            compressor_release,
-        ],
-    )
-    delay.change(
-        fn=delay_visible,
-        inputs=[delay],
-        outputs=[delay_seconds, delay_feedback, delay_mix],
-    )
-    post_process_batch.change(
-        fn=post_process_visible,
-        inputs=[post_process_batch],
-        outputs=[
-            reverb_batch,
-            pitch_shift_batch,
-            limiter_batch,
-            gain_batch,
-            distortion_batch,
-            chorus_batch,
-            bitcrush_batch,
-            clipping_batch,
-            compressor_batch,
-            delay_batch,
-        ],
-    )
-    reverb_batch.change(
-        fn=reverb_visible,
-        inputs=[reverb_batch],
-        outputs=[
-            reverb_room_size_batch,
-            reverb_damping_batch,
-            reverb_wet_gain_batch,
-            reverb_dry_gain_batch,
-            reverb_width_batch,
-            reverb_freeze_mode_batch,
-        ],
-    )
-    pitch_shift_batch.change(
-        fn=toggle_visible,
-        inputs=[pitch_shift_batch],
-        outputs=[pitch_shift_semitones_batch],
-    )
-    limiter_batch.change(
-        fn=limiter_visible,
-        inputs=[limiter_batch],
-        outputs=[limiter_threshold_batch, limiter_release_time_batch],
-    )
-    gain_batch.change(
-        fn=toggle_visible,
-        inputs=[gain_batch],
-        outputs=[gain_db_batch],
-    )
-    distortion_batch.change(
-        fn=toggle_visible,
-        inputs=[distortion_batch],
-        outputs=[distortion_gain_batch],
-    )
-    chorus_batch.change(
-        fn=chorus_visible,
-        inputs=[chorus_batch],
-        outputs=[
-            chorus_rate_batch,
-            chorus_depth_batch,
-            chorus_center_delay_batch,
-            chorus_feedback_batch,
-            chorus_mix_batch,
-        ],
-    )
-    bitcrush_batch.change(
-        fn=toggle_visible,
-        inputs=[bitcrush_batch],
-        outputs=[bitcrush_bit_depth_batch],
-    )
-    clipping_batch.change(
-        fn=toggle_visible,
-        inputs=[clipping_batch],
-        outputs=[clipping_threshold_batch],
-    )
-    compressor_batch.change(
-        fn=compress_visible,
-        inputs=[compressor_batch],
-        outputs=[
-            compressor_threshold_batch,
-            compressor_ratio_batch,
-            compressor_attack_batch,
-            compressor_release_batch,
-        ],
-    )
-    delay_batch.change(
-        fn=delay_visible,
-        inputs=[delay_batch],
-        outputs=[delay_seconds_batch, delay_feedback_batch, delay_mix_batch],
-    )
     autotune_batch.change(
         fn=toggle_visible,
         inputs=[autotune_batch],
         outputs=[autotune_strength_batch],
-    )
-    clean_audio_batch.change(
-        fn=toggle_visible,
-        inputs=[clean_audio_batch],
-        outputs=[clean_strength_batch],
     )
     refresh_button.click(
         fn=change_choices,
@@ -2181,7 +1393,7 @@ def inference_tab():
         outputs=[],
     )
     refresh_embedders_button.click(
-        fn=lambda: gr.update(choices=refresh_embedders_folders()),
+        fn=lambda: gr.update(choices=path_choices(refresh_embedders_folders())),
         inputs=[],
         outputs=[embedder_model_custom],
     )
@@ -2195,7 +1407,7 @@ def inference_tab():
         outputs=[],
     )
     refresh_embedders_button_batch.click(
-        fn=lambda: gr.update(choices=refresh_embedders_folders()),
+        fn=lambda: gr.update(choices=path_choices(refresh_embedders_folders())),
         inputs=[],
         outputs=[embedder_model_custom_batch],
     )
@@ -2217,50 +1429,12 @@ def inference_tab():
             autotune_strength,
             proposed_pitch,
             proposed_pitch_threshold,
-            clean_audio,
-            clean_strength,
             export_format,
             embedder_model,
             embedder_model_custom,
             formant_shifting,
             formant_qfrency,
             formant_timbre,
-            post_process,
-            reverb,
-            pitch_shift,
-            limiter,
-            gain,
-            distortion,
-            chorus,
-            bitcrush,
-            clipping,
-            compressor,
-            delay,
-            reverb_room_size,
-            reverb_damping,
-            reverb_wet_gain,
-            reverb_dry_gain,
-            reverb_width,
-            reverb_freeze_mode,
-            pitch_shift_semitones,
-            limiter_threshold,
-            limiter_release_time,
-            gain_db,
-            distortion_gain,
-            chorus_rate,
-            chorus_depth,
-            chorus_center_delay,
-            chorus_feedback,
-            chorus_mix,
-            bitcrush_bit_depth,
-            clipping_threshold,
-            compressor_threshold,
-            compressor_ratio,
-            compressor_attack,
-            compressor_release,
-            delay_seconds,
-            delay_feedback,
-            delay_mix,
             sid,
         ],
         outputs=[vc_output1, vc_output2],
@@ -2287,50 +1461,12 @@ def inference_tab():
             autotune_strength_batch,
             proposed_pitch_batch,
             proposed_pitch_threshold_batch,
-            clean_audio_batch,
-            clean_strength_batch,
             export_format_batch,
             embedder_model_batch,
             embedder_model_custom_batch,
             formant_shifting_batch,
             formant_qfrency_batch,
             formant_timbre_batch,
-            post_process_batch,
-            reverb_batch,
-            pitch_shift_batch,
-            limiter_batch,
-            gain_batch,
-            distortion_batch,
-            chorus_batch,
-            bitcrush_batch,
-            clipping_batch,
-            compressor_batch,
-            delay_batch,
-            reverb_room_size_batch,
-            reverb_damping_batch,
-            reverb_wet_gain_batch,
-            reverb_dry_gain_batch,
-            reverb_width_batch,
-            reverb_freeze_mode_batch,
-            pitch_shift_semitones_batch,
-            limiter_threshold_batch,
-            limiter_release_time_batch,
-            gain_db_batch,
-            distortion_gain_batch,
-            chorus_rate_batch,
-            chorus_depth_batch,
-            chorus_center_delay_batch,
-            chorus_feedback_batch,
-            chorus_mix_batch,
-            bitcrush_bit_depth_batch,
-            clipping_threshold_batch,
-            compressor_threshold_batch,
-            compressor_ratio_batch,
-            compressor_attack_batch,
-            compressor_release_batch,
-            delay_seconds_batch,
-            delay_feedback_batch,
-            delay_mix_batch,
             sid_batch,
         ],
         outputs=[vc_output3],

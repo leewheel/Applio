@@ -13,7 +13,7 @@ class AudioCallbacks:
     def __init__(
         self,
         pass_through: bool = False,
-        read_chunk_size: int = 192,
+        block_frame: int = 24576,
         cross_fade_overlap_size: float = 0.1,
         extra_convert_size: float = 0.5,
         model_path: str = None,
@@ -38,9 +38,9 @@ class AudioCallbacks:
         vad_sensitivity: int = 3,
         vad_frame_ms: int = 30,
         sid: int = 0,
-        clean_audio: bool = False,
-        clean_strength: float = 0.5,
-        post_process: bool = False,
+        formant_shifting: bool = False,
+        formant_qfrency: float = 1.0,
+        formant_timbre: float = 1.0,
         record_audio: bool = False,
         record_audio_path: str = None,
         export_format: str = "WAV",
@@ -53,7 +53,7 @@ class AudioCallbacks:
         self._last_vol = 0
 
         vc_kwargs = dict(
-            read_chunk_size=read_chunk_size,
+            block_frame=block_frame,
             cross_fade_overlap_size=cross_fade_overlap_size,
             extra_convert_size=extra_convert_size,
             model_path=model_path,
@@ -66,13 +66,14 @@ class AudioCallbacks:
             vad_sensitivity=vad_sensitivity,
             vad_frame_ms=vad_frame_ms,
             sid=sid,
-            clean_audio=clean_audio,
-            clean_strength=clean_strength,
-            post_process=post_process,
+            formant_shifting=formant_shifting,
+            formant_qfrency=formant_qfrency,
+            formant_timbre=formant_timbre,
             record_audio=record_audio,
             record_audio_path=record_audio_path,
             export_format=export_format,
             audio_sample_rate=audio_sample_rate,
+            index_rate=index_rate,
             **kwargs,
         )
         self.vc = VoiceChangerWorker(vc_kwargs)
@@ -108,7 +109,7 @@ class AudioCallbacks:
     ):
         if self.pass_through:
             vol = float(np.sqrt(np.square(received_data).mean(dtype=np.float32)))
-            return received_data, vol, [0, 0, 0], None
+            return received_data, vol, 0
 
         params = dict(
             f0_up_key=f0_up_key,
@@ -127,13 +128,13 @@ class AudioCallbacks:
             audio, vol, perf_ms, _warmup = result
             self._last_output = audio
             self._last_vol = vol
-            return audio, vol, [0, perf_ms, 0], None
+            return audio, vol, perf_ms
 
         # No result ready yet; replay previous output to avoid underrun.
         if (
             self._last_output is not None
             and self._last_output.shape[0] == received_data.shape[0]
         ):
-            return self._last_output, self._last_vol, [0, 0, 0], None
+            return self._last_output, self._last_vol, 0
 
-        return np.zeros(received_data.shape[0], dtype=np.float32), 0, [0, 0, 0], None
+        return np.zeros(received_data.shape[0], dtype=np.float32), 0, 0

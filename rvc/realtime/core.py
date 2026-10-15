@@ -1,34 +1,94 @@
 import os
 import sys
+
+if sys.platform == "darwin":
+    os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
 import time
 import torch
 import torch.nn.functional as F
 import torchaudio.transforms as tat
 import numpy as np
-from noisereduce.torchgate import TorchGate
-from pedalboard import (
-    Pedalboard,
-    Chorus,
-    Distortion,
-    Reverb,
-    PitchShift,
-    Limiter,
-    Gain,
-    Bitcrush,
-    Clipping,
-    Compressor,
-    Delay,
-)
 
 now_dir = os.getcwd()
 sys.path.append(now_dir)
 
 from rvc.realtime.utils.torch import circular_write
+from rvc.lib.user_config import resolve_logs_path
 from rvc.realtime.utils.vad import VADProcessor
-from rvc.realtime.pipeline import create_pipeline
+from rvc.realtime.pipeline import create_pipeline, CudaGraphCaptureError
 
 SAMPLE_RATE = 16000
 AUDIO_SAMPLE_RATE = 48000
+
+
+def phase_vocoder(a, b, fade_out, fade_in):
+    """
+    Performs a phase vocoder crossfade between two audio segments.
+
+    This function blends segment `a` and segment `b` by aligning their phases
+    in the frequency domain to prevent phase cancellation during the transition,
+    while applying the provided fade-out and fade-in windows.
+
+    Args:
+        a (torch.Tensor): The first audio segment.
+        b (torch.Tensor): The second audio segment.
+        fade_out (torch.Tensor): The fade-out window applied to segment `a`.
+        fade_in (torch.Tensor): The fade-in window applied to segment `b`.
+
+    Returns:
+        torch.Tensor: The crossfaded audio segment.
+    """
+    if a.device.type == "mps":
+        return phase_vocoder(a.cpu(), b.cpu(), fade_out.cpu(), fade_in.cpu()).to(
+            a.device
+        )
+
+    # Compute the analysis window as the geometric mean of fade curves
+    window = (fade_out * fade_in).sqrt()
+    # Transform both windowed segments to the frequency domain (Real FFT)
+    fa = torch.fft.rfft(a * window)
+    fb = torch.fft.rfft(b * window)
+    # Calculate the combined magnitude spectrum
+    absab = fa.abs() + fb.abs()
+    n = a.shape[0]
+
+    # Compensate for the energy of negative frequencies (except DC and Nyquist components)
+    if n % 2 == 0:
+        absab[1:-1] *= 2
+    else:
+        absab[1:] *= 2
+
+    # Extract initial phase and calculate the raw phase difference
+    phia = fa.angle()
+    deltaphase = fb.angle() - phia
+
+    # Reconstruct the signal using a combination of time-domain crossfade
+    # and phase-aligned sinusoidal synthesis (Phase Vocoder)
+    return (
+        a * (fade_out**2)
+        + b * (fade_in**2)
+        + (
+            absab
+            * (
+                (
+                    # Base frequency grid for each bin
+                    2
+                    * torch.pi
+                    * torch.arange(n // 2 + 1, device=a.device, dtype=a.dtype)
+                    +
+                    # Phase unwrapping (wrapping delta phase to the [-pi, pi] range)
+                    (
+                        deltaphase
+                        - 2 * torch.pi * (deltaphase / 2 / torch.pi + 0.5).floor()
+                    )
+                )
+                * (torch.arange(n, device=a.device, dtype=a.dtype).unsqueeze(-1) / n)
+                + phia  # Continuous phase evolution over time
+            ).cos()
+        ).sum(-1)
+        * window
+        / n  # Sum the sinusoidal components (IFFT equivalent) and normalize
+    )
 
 
 class Realtime:
@@ -41,12 +101,12 @@ class Realtime:
         embedder_model_custom: str = None,
         silent_threshold: int = 0,
         vad_enabled: bool = False,
-        vad_sensitivity: int = 3,
+        vad_sensitivity: int = 1,
         vad_frame_ms: int = 30,
         sid: int = 0,
-        clean_audio: bool = False,
-        clean_strength: float = 0.5,
-        post_process: bool = False,
+        formant_shifting: bool = False,
+        formant_qfrency: float = 1.0,
+        formant_timbre: float = 1.0,
         **kwargs,
         # device: str = "cuda",
     ):
@@ -61,6 +121,8 @@ class Realtime:
         self.input_sensitivity = 10 ** (silent_threshold / 20)
         self.window_size = self.sample_rate // 100
         self.kwargs = None
+        model_path = resolve_logs_path(model_path)
+        index_path = resolve_logs_path(index_path)
         self.model_path = model_path
         self.index_path = index_path
         self.embedder_model = embedder_model
@@ -75,7 +137,12 @@ class Realtime:
             if vad_enabled
             else None
         )
-        self.board = self.setup_pedalboard(**kwargs) if post_process else None
+        # Formant shifting (same STFT method as offline inference).
+        self.formant_shifting = bool(formant_shifting)
+        self.formant_qfrency = float(formant_qfrency)
+        self.formant_timbre = float(formant_timbre)
+        self._formant_shifter = None
+        self.kwargs = None
         # Create conversion pipelines
         self.pipeline = create_pipeline(
             model_path,
@@ -85,18 +152,13 @@ class Realtime:
             embedder_model_custom,
             # device,
             sid,
+            device=kwargs.get("device"),
         )
         self.device = self.pipeline.device
         self.dtype = self.pipeline.dtype
-        # noise reduce
-        self.reduced_noise = (
-            TorchGate(
-                self.pipeline.tgt_sr,
-                prop_decrease=clean_strength,
-            ).to(self.device)
-            if clean_audio
-            else None
-        )
+        # Clean-audio noise reduction was removed (Voice Focus covers input
+        # denoising, and TorchGate is too demanding for realtime).
+        self.reduced_noise = None
         # Resampling of inputs and outputs.
         self.resample_in = tat.Resample(
             orig_freq=AUDIO_SAMPLE_RATE, new_freq=self.sample_rate, dtype=torch.float32
@@ -106,66 +168,6 @@ class Realtime:
             new_freq=AUDIO_SAMPLE_RATE,
             dtype=torch.float32,
         ).to(self.device)
-
-    def setup_pedalboard(self, **kwargs):
-        board = Pedalboard()
-        if kwargs.get("reverb", False):
-            reverb = Reverb(
-                room_size=kwargs.get("reverb_room_size", 0.5),
-                damping=kwargs.get("reverb_damping", 0.5),
-                wet_level=kwargs.get("reverb_wet_level", 0.33),
-                dry_level=kwargs.get("reverb_dry_level", 0.4),
-                width=kwargs.get("reverb_width", 1.0),
-                freeze_mode=kwargs.get("reverb_freeze_mode", 0),
-            )
-            board.append(reverb)
-        if kwargs.get("pitch_shift", False):
-            pitch_shift = PitchShift(semitones=kwargs.get("pitch_shift_semitones", 0))
-            board.append(pitch_shift)
-        if kwargs.get("limiter", False):
-            limiter = Limiter(
-                threshold_db=kwargs.get("limiter_threshold", -6),
-                release_ms=kwargs.get("limiter_release", 0.05),
-            )
-            board.append(limiter)
-        if kwargs.get("gain", False):
-            gain = Gain(gain_db=kwargs.get("gain_db", 0))
-            board.append(gain)
-        if kwargs.get("distortion", False):
-            distortion = Distortion(drive_db=kwargs.get("distortion_gain", 25))
-            board.append(distortion)
-        if kwargs.get("chorus", False):
-            chorus = Chorus(
-                rate_hz=kwargs.get("chorus_rate", 1.0),
-                depth=kwargs.get("chorus_depth", 0.25),
-                centre_delay_ms=kwargs.get("chorus_delay", 7),
-                feedback=kwargs.get("chorus_feedback", 0.0),
-                mix=kwargs.get("chorus_mix", 0.5),
-            )
-            board.append(chorus)
-        if kwargs.get("bitcrush", False):
-            bitcrush = Bitcrush(bit_depth=kwargs.get("bitcrush_bit_depth", 8))
-            board.append(bitcrush)
-        if kwargs.get("clipping", False):
-            clipping = Clipping(threshold_db=kwargs.get("clipping_threshold", 0))
-            board.append(clipping)
-        if kwargs.get("compressor", False):
-            compressor = Compressor(
-                threshold_db=kwargs.get("compressor_threshold", 0),
-                ratio=kwargs.get("compressor_ratio", 1),
-                attack_ms=kwargs.get("compressor_attack", 1.0),
-                release_ms=kwargs.get("compressor_release", 100),
-            )
-            board.append(compressor)
-        if kwargs.get("delay", False):
-            delay = Delay(
-                delay_seconds=kwargs.get("delay_seconds", 0.5),
-                feedback=kwargs.get("delay_feedback", 0.0),
-                mix=kwargs.get("delay_mix", 0.5),
-            )
-            board.append(delay)
-
-        return board
 
     def realloc(
         self,
@@ -202,8 +204,9 @@ class Realtime:
         self.silence_front = (
             extra_frame_16k - (self.window_size * 5) if self.silence_front else 0
         )
-        # Number of blocks to fill convert_buffer before enabling model output.
-        self.warmup_blocks = int(np.ceil(convert_size_16k / block_frame_16k)) + 1
+        # Extra context is zero-padded history, not an output delay. Converting
+        # the current block immediately avoids seconds of forced startup silence.
+        self.warmup_blocks = 0
         # Audio buffer to measure volume between chunks
         audio_buffer_size = block_frame_16k + crossfade_frame_16k
         self.audio_buffer = torch.zeros(
@@ -222,6 +225,27 @@ class Realtime:
             self.convert_feature_size_16k + 1, dtype=self.dtype, device=self.device
         )
 
+    def _apply_formant_shift(self, audio_16k):
+        """Apply offline-style formant shifting to a 16 kHz block (no-op when disabled)."""
+        if not self.formant_shifting:
+            return audio_16k
+        try:
+            from stftpitchshift import StftPitchShift
+
+            if self._formant_shifter is None:
+                self._formant_shifter = StftPitchShift(1024, 32, self.sample_rate)
+            audio_np = audio_16k.detach().to("cpu").float().numpy()
+            shifted = self._formant_shifter.shiftpitch(
+                audio_np,
+                factors=1,
+                quefrency=float(self.formant_qfrency) * 1e-3,
+                distortion=float(self.formant_timbre),
+            )
+            return torch.as_tensor(shifted, device=audio_16k.device).to(audio_16k.dtype)
+        except Exception as error:
+            print(f"Formant shifting failed, bypassing: {error}")
+            return audio_16k
+
     def inference(
         self,
         audio_input: np.ndarray,
@@ -237,112 +261,42 @@ class Realtime:
         if self.pipeline is None:
             raise RuntimeError("Pipeline is not initialized.")
 
+        if index_rate <= 0:
+            self.pipeline.prepare_index(index_rate)
+
         # Input audio is always float32
         audio_input_16k = self.resample_in(
             torch.as_tensor(audio_input, dtype=torch.float32, device=self.device)
         ).to(self.dtype)
+        audio_input_16k = self._apply_formant_shift(audio_input_16k)
         circular_write(audio_input_16k, self.audio_buffer)
 
-        vol_t = torch.sqrt(torch.square(self.audio_buffer).mean())
+        vol_t = torch.sqrt(torch.square(audio_input_16k).mean())
         vol = max(vol_t.item(), 0)
 
-        board = self.board
-        reduced_noise = self.reduced_noise
+        # Post-processing (pedalboard) and clean-audio noise reduction were
+        # removed; Voice Focus handles input denoising.
+        board = None
+        reduced_noise = None
 
-        # Fill convert_buffer with real audio, output zeros during warmup.
-        if self.warmup_blocks > 0:
-            self.warmup_blocks -= 1
-            circular_write(audio_input_16k, self.convert_buffer)
-            audio_model = self.pipeline.voice_conversion(
-                self.convert_buffer,
-                self.pitch_buffer,
-                self.pitchf_buffer,
-                f0_up_key,
-                index_rate,
-                self.convert_feature_size_16k,
-                self.silence_front,
-                self.skip_head,
-                self.return_length,
-                protect,
-                volume_envelope,
-                f0_autotune,
-                f0_autotune_strength,
-                proposed_pitch,
-                proposed_pitch_threshold,
-                reduced_noise,
-                board,
-                block_size_16k=self.block_frame_16k,
-            )
-            return (
-                torch.zeros(audio_model.shape, dtype=torch.float32, device=self.device),
-                vol,
-                True,
-            )
-
-        if self.vad is not None:
-            is_speech = self.vad.is_speech(audio_input_16k.cpu().numpy().copy())
-            if not is_speech:
-                # Busy wait to keep power manager happy and clocks stable. Running pipeline on-demand seems to lag when the delay between
-                # voice changer activation is too high.
-                # https://forums.developer.nvidia.com/t/why-kernel-calculate-speed-got-slower-after-waiting-for-a-while/221059/9
-                audio_model = self.pipeline.voice_conversion(
-                    self.convert_buffer,
-                    self.pitch_buffer,
-                    self.pitchf_buffer,
-                    f0_up_key,
-                    index_rate,
-                    self.convert_feature_size_16k,
-                    self.silence_front,
-                    self.skip_head,
-                    self.return_length,
-                    protect,
-                    volume_envelope,
-                    f0_autotune,
-                    f0_autotune_strength,
-                    proposed_pitch,
-                    proposed_pitch_threshold,
-                    reduced_noise,
-                    board,
-                    block_size_16k=self.block_frame_16k,
-                )
-
-                return (
-                    torch.zeros(
-                        audio_model.shape, dtype=torch.float32, device=self.device
-                    ),
-                    vol,
-                    True,
-                )
-
-        if vol < self.input_sensitivity:
-            audio_model = self.pipeline.voice_conversion(
-                self.convert_buffer,
-                self.pitch_buffer,
-                self.pitchf_buffer,
-                f0_up_key,
-                index_rate,
-                self.convert_feature_size_16k,
-                self.silence_front,
-                self.skip_head,
-                self.return_length,
-                protect,
-                volume_envelope,
-                f0_autotune,
-                f0_autotune_strength,
-                proposed_pitch,
-                proposed_pitch_threshold,
-                reduced_noise,
-                board,
-                block_size_16k=self.block_frame_16k,
-            )
-
-            return (
-                torch.zeros(audio_model.shape, dtype=torch.float32, device=self.device),
-                vol,
-                True,
-            )
-
+        # Advance context even while gated; stale speech must not be replayed.
         circular_write(audio_input_16k, self.convert_buffer)
+        is_silence = (
+            (
+                not self.vad.is_speech(audio_input_16k.cpu().numpy().copy())
+                or vol < self.input_sensitivity
+            )
+            if self.vad is not None
+            else vol < self.input_sensitivity
+        )
+
+        if is_silence:
+            # The caller emits a silent block. Avoid running the embedder,
+            # predictor and decoder for an output which would be discarded.
+            self.convert_buffer.zero_()
+            self.pitch_buffer.zero_()
+            self.pitchf_buffer.zero_()
+            return audio_input_16k.new_zeros(audio_input.shape[0]), vol, True
 
         audio_model = self.pipeline.voice_conversion(
             self.convert_buffer,
@@ -361,22 +315,25 @@ class Realtime:
             proposed_pitch,
             proposed_pitch_threshold,
             reduced_noise,
-            board,
             block_size_16k=self.block_frame_16k,
         )
 
-        # Scale output by the current input RMS to suppress residue during silence.
-        audio_out: torch.Tensor = self.resample_out(audio_model * vol_t)
-        return audio_out, vol, False
+        # RMS matching is already controlled by volume_envelope in the pipeline.
+        # Multiplying by input RMS again causes pumping and double attenuation.
+        audio_out: torch.Tensor = self.resample_out(audio_model)
+        if is_silence:
+            audio_out.zero_()
+        return audio_out, vol, is_silence
 
     def __del__(self):
-        del self.pipeline
+        if hasattr(self, "pipeline"):
+            del self.pipeline
 
 
 class VoiceChanger:
     def __init__(
         self,
-        read_chunk_size: int,
+        block_frame: int,
         cross_fade_overlap_size: float,
         extra_convert_size: float,
         model_path: str = None,
@@ -386,12 +343,12 @@ class VoiceChanger:
         embedder_model_custom: str = None,
         silent_threshold: int = 0,
         vad_enabled: bool = False,
-        vad_sensitivity: int = 3,
+        vad_sensitivity: int = 1,
         vad_frame_ms: int = 30,
         sid: int = 0,
-        clean_audio: bool = False,
-        clean_strength: float = 0.5,
-        post_process: bool = False,
+        formant_shifting: bool = False,
+        formant_qfrency: float = 1.0,
+        formant_timbre: float = 1.0,
         record_audio: bool = False,
         record_audio_path: str = None,
         export_format: str = "WAV",
@@ -402,7 +359,7 @@ class VoiceChanger:
         self.record_audio = record_audio
         self.record_audio_path = record_audio_path
         self.export_format = export_format
-        self.block_frame = read_chunk_size * 128
+        self.block_frame = block_frame
         self.crossfade_frame = int(cross_fade_overlap_size * AUDIO_SAMPLE_RATE)
         self.extra_frame = int(extra_convert_size * AUDIO_SAMPLE_RATE)
         self.sola_search_frame = AUDIO_SAMPLE_RATE // 100
@@ -418,13 +375,14 @@ class VoiceChanger:
             vad_sensitivity,
             vad_frame_ms,
             sid,
-            clean_audio,
-            clean_strength,
-            post_process,
+            formant_shifting,
+            formant_qfrency,
+            formant_timbre,
             **kwargs,
             # device
         )
         self.device = self.vc_model.device
+        print(f"Realtime computation device: {self.device} (FP32).", flush=True)
         self.vc_model.realloc(
             self.block_frame,
             self.extra_frame,
@@ -458,6 +416,67 @@ class VoiceChanger:
         self.sola_buffer = torch.zeros(
             self.crossfade_frame, device=self.device, dtype=torch.float32
         )
+        self._sola_graph_cache = None
+        self._tail_remaining = 0
+
+    def _phase_aligned_output(self, audio, block_size):
+        """SOLA and phase crossfade with the alignment offset kept on-device."""
+        needed = block_size + self.crossfade_frame
+        padded = F.pad(
+            audio, (0, max(0, needed + self.sola_search_frame - audio.shape[0]))
+        )
+        conv_input = padded[
+            None, None, : self.crossfade_frame + self.sola_search_frame
+        ].float()
+        numerator = F.conv1d(conv_input, self.sola_buffer[None, None, :])
+        denominator = torch.sqrt(
+            F.conv1d(conv_input**2, self.sola_denominator_kernel) + 1e-8
+        )
+        offset = torch.argmax(numerator[0, 0] / denominator[0, 0])
+        positions = torch.arange(needed, device=audio.device) + offset
+        aligned = padded.index_select(0, positions)
+        aligned[: self.crossfade_frame] = phase_vocoder(
+            self.sola_buffer,
+            aligned[: self.crossfade_frame],
+            self.fade_out_window,
+            self.fade_in_window,
+        )
+        self.sola_buffer.copy_(aligned[block_size:needed])
+        return aligned[:block_size]
+
+    def _graph_phase_output(self, audio, block_size):
+        # Model inference is already captured. Capture the remaining GPU output
+        # operations separately, without a host-side alignment-offset read.
+        key = (tuple(audio.shape), audio.dtype, audio.device, block_size)
+        cache = self._sola_graph_cache
+        if cache is None or cache[0] != key:
+            self._sola_graph_cache = None
+            static_audio = torch.empty_like(audio)
+            static_audio.copy_(audio)
+            saved = self.sola_buffer.clone()
+            original_stream = torch.cuda.current_stream(self.device)
+            failed = False
+            try:
+                for _ in range(3):
+                    self._phase_aligned_output(static_audio, block_size)
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph):
+                    output = self._phase_aligned_output(static_audio, block_size)
+                cache = (key, static_audio, graph, output)
+                self._sola_graph_cache = cache
+            except (RuntimeError, torch.OutOfMemoryError) as error:
+                failed = True
+                self.vc_model.pipeline._graph_failed = True
+                raise CudaGraphCaptureError(
+                    "CUDA output graph capture failed; restart with eager inference"
+                ) from error
+            finally:
+                torch.cuda.set_stream(original_stream)
+                if not failed:
+                    self.sola_buffer.copy_(saved)
+        cache[1].copy_(audio)
+        cache[2].replay()
+        return cache[3]
 
     def setup_soundfile_record(self):
         import soundfile as sf
@@ -485,6 +504,7 @@ class VoiceChanger:
         f0_autotune_strength: float = 1,
         proposed_pitch: bool = False,
         proposed_pitch_threshold: float = 155.0,
+        use_phase_vocoder: bool = True,
     ):
         block_size = audio_input.shape[0]
 
@@ -501,15 +521,41 @@ class VoiceChanger:
         )
 
         if is_silence:
-            # Clear sola_buffer and return zeros for silent input.
-            self.sola_buffer.zero_()
             silence_output = np.zeros(block_size, dtype=np.float32)
+            # Finish already generated audio instead of cutting it at the
+            # microphone gate. A finite fade drains the overlap exactly once.
+            remaining = getattr(self, "_tail_remaining", 0)
+            if remaining:
+                count = min(block_size, remaining)
+                start = self.crossfade_frame - remaining
+                tail = (
+                    self.sola_buffer[start : start + count]
+                    * self.fade_out_window[start : start + count]
+                )
+                silence_output[:count] = tail.detach().cpu().numpy()
+                self._tail_remaining = remaining - count
+            if not getattr(self, "_tail_remaining", 0):
+                self.sola_buffer.zero_()
             if self.record_audio and self.soundfile is not None:
                 self.soundfile.write(silence_output)
             return silence_output, vol
 
-        # Detect silence-to-speech transition for onset-aware fade-in.
-        is_onset = not self.sola_buffer.any()
+        # A new utterance must not replay overlap already drained by the gate.
+        remaining = getattr(self, "_tail_remaining", 0)
+        if 0 < remaining < self.crossfade_frame:
+            self.sola_buffer.zero_()
+
+        if (
+            use_phase_vocoder
+            and getattr(self.vc_model.pipeline, "_graph_cache", None) is not None
+        ):
+            self._tail_remaining = self.crossfade_frame
+            audio_output = (
+                self._graph_phase_output(audio, block_size).detach().cpu().numpy()
+            )
+            if self.record_audio and self.soundfile is not None:
+                self.soundfile.write(audio_output)
+            return audio_output, vol
 
         conv_input = audio[
             None, None, : self.crossfade_frame + self.sola_search_frame
@@ -522,32 +568,46 @@ class VoiceChanger:
 
         audio = audio[sola_offset:]
 
-        if is_onset:
-            # Find voice onset position and apply sin² fade-in, zeroing audio before onset.
-            hop = 160  # ~3.3 ms at 48 kHz
-            n_hops = block_size // hop
-            if n_hops >= 1:
-                hop_energy = (
-                    audio[: n_hops * hop].reshape(n_hops, hop).abs().max(dim=1).values
-                )
-                peak = hop_energy.max().item()
-                onset_sample = 0
-                if peak > 1e-4:
-                    above = (hop_energy > 0.1 * peak).nonzero(as_tuple=False)
-                    if len(above) > 0:
-                        onset_sample = int(above[0].item()) * hop
-            else:
-                onset_sample = 0
-            audio[:onset_sample] = 0.0
-            # Apply sin² fade-in over crossfade_frame duration from onset.
-            fade_len = min(block_size - onset_sample, self.crossfade_frame)
-            if fade_len > 0:
-                audio[onset_sample : onset_sample + fade_len] *= self.fade_in_window[
-                    :fade_len
-                ]
+        if use_phase_vocoder:
+            audio[: self.crossfade_frame] = phase_vocoder(
+                self.sola_buffer,
+                audio[: self.crossfade_frame],
+                self.fade_out_window,
+                self.fade_in_window,
+            )
         else:
-            audio[: self.crossfade_frame] *= self.fade_in_window
-            audio[: self.crossfade_frame] += self.sola_buffer * self.fade_out_window
+            # Only the time-domain crossfade needs this host-side decision.
+            is_onset = not self.sola_buffer.any()
+            if is_onset:
+                # Find voice onset position and apply sin² fade-in, zeroing audio before onset.
+                hop = 160  # ~3.3 ms at 48 kHz
+                n_hops = block_size // hop
+                if n_hops >= 1:
+                    hop_energy = (
+                        audio[: n_hops * hop]
+                        .reshape(n_hops, hop)
+                        .abs()
+                        .max(dim=1)
+                        .values
+                    )
+                    peak = hop_energy.max().item()
+                    onset_sample = 0
+                    if peak > 1e-4:
+                        above = (hop_energy > 0.1 * peak).nonzero(as_tuple=False)
+                        if len(above) > 0:
+                            onset_sample = int(above[0].item()) * hop
+                else:
+                    onset_sample = 0
+                audio[:onset_sample] = 0.0
+                # Apply sin² fade-in over crossfade_frame duration from onset.
+                fade_len = min(block_size - onset_sample, self.crossfade_frame)
+                if fade_len > 0:
+                    audio[
+                        onset_sample : onset_sample + fade_len
+                    ] *= self.fade_in_window[:fade_len]
+            else:
+                audio[: self.crossfade_frame] *= self.fade_in_window
+                audio[: self.crossfade_frame] += self.sola_buffer * self.fade_out_window
 
         # Pad if audio is shorter than block_size + crossfade_frame.
         _need = block_size + self.crossfade_frame
@@ -557,12 +617,41 @@ class VoiceChanger:
             )
             audio = torch.cat([audio, pad])
         self.sola_buffer[:] = audio[block_size : block_size + self.crossfade_frame]
+        self._tail_remaining = self.crossfade_frame
         audio_output = audio[:block_size].detach().cpu().numpy()
 
         if self.record_audio and self.soundfile is not None:
             self.soundfile.write(audio_output)
 
         return audio_output, vol
+
+    def warmup(self, **kwargs):
+        # Silence gating normally bypasses output resampling and SOLA. Warm
+        # those kernels too, so the first spoken block has no cold-start stall.
+        model = self.vc_model
+        vad, threshold = model.vad, model.input_sensitivity
+        model.vad, model.input_sensitivity = None, -1
+        completed = False
+        try:
+            timings = []
+            for _ in range(5):
+                _, _, perf = self.on_request(
+                    np.zeros(self.block_frame, dtype=np.float32), **kwargs
+                )
+                timings.append(perf[1])
+            completed = True
+            return max(timings[-3:])
+        finally:
+            model.vad, model.input_sensitivity = vad, threshold
+            if completed:
+                for buffer in (
+                    model.audio_buffer,
+                    model.convert_buffer,
+                    model.pitch_buffer,
+                    model.pitchf_buffer,
+                    self.sola_buffer,
+                ):
+                    buffer.zero_()
 
     @torch.no_grad()
     def on_request(
@@ -576,6 +665,7 @@ class VoiceChanger:
         f0_autotune_strength: float = 1,
         proposed_pitch: bool = False,
         proposed_pitch_threshold: float = 155.0,
+        use_phase_vocoder: bool = True,
     ):
         if self.vc_model is None:
             raise RuntimeError("Voice Changer is not selected.")
@@ -593,6 +683,7 @@ class VoiceChanger:
             f0_autotune_strength,
             proposed_pitch,
             proposed_pitch_threshold,
+            use_phase_vocoder,
         )
         end = time.perf_counter()
 
