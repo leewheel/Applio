@@ -19,6 +19,14 @@ if not exist env (
     exit /b 1
 )
 
+set HTTP_PROXY=
+set HTTPS_PROXY=
+set http_proxy=
+set https_proxy=
+set NO_PROXY=*
+set no_proxy=*
+set ALL_PROXY=
+set all_proxy=
 env\python.exe app.py --open
 echo.
 pause
