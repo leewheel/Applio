@@ -1,6 +1,11 @@
 import os
 import sys
 
+sys.path.append(os.getcwd())
+from rvc.lib.terminal import capture_worker_output
+
+capture_worker_output()
+
 if sys.platform == "darwin":
     os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
 
@@ -399,7 +404,9 @@ def run(
     # Validations
     if len(train_loader) < 3:
         print(
-            "Not enough data present in the training set. Perhaps you forgot to slice the audio files in preprocess?"
+            f"Not enough data present in the training set ({len(train_dataset)} segments -> {len(train_loader)} batches with batch size {batch_size}). "
+            "Perhaps you forgot to slice the audio files in preprocess? "
+            "Add more audio, re-run preprocess without 'Skip' cutting, or lower the batch size."
         )
         os._exit(1)
 

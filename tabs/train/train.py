@@ -7,6 +7,7 @@ from multiprocessing import cpu_count
 import gradio as gr
 
 from assets.i18n.i18n import I18nAuto
+from assets.app_shell import step_card
 from core import (
     run_extract_script,
     run_index_script,
@@ -365,7 +366,7 @@ def train_tab():
         return result
 
     # Model settings section
-    with gr.Accordion(i18n("Model Settings")):
+    with step_card(1, "Model Settings", i18n, description="Name your model and choose sample rate, architecture and hardware."):
         with gr.Row():
             with gr.Column():
                 model_name = gr.Dropdown(
@@ -376,7 +377,8 @@ def train_tab():
                     interactive=True,
                     allow_custom_value=True,
                 )
-                architecture = gr.Radio(
+                architecture = gr.Dropdown(
+                    filterable=False,
                     label=i18n("Architecture"),
                     info=i18n(
                         "Choose the model architecture:\n- **RVC (V2)**: Default option, compatible with all clients.\n- **Applio**: Advanced quality with improved vocoders and higher sample rates, Applio-only."
@@ -387,14 +389,16 @@ def train_tab():
                     visible=False,
                 )
             with gr.Column():
-                sampling_rate = gr.Radio(
+                sampling_rate = gr.Dropdown(
+                    filterable=False,
                     label=i18n("Sampling Rate"),
                     info=i18n("The sampling rate of the audio files."),
                     choices=["32000", "40000", "48000"],
                     value="40000",
                     interactive=True,
                 )
-                vocoder = gr.Radio(
+                vocoder = gr.Dropdown(
+                    filterable=False,
                     label=i18n("Vocoder"),
                     info=i18n(
                         "Choose the vocoder for audio synthesis:\n- **HiFi-GAN**: Default option, compatible with all clients.\n- **MRF HiFi-GAN**: Higher fidelity, Applio-only.\n- **RefineGAN**: Superior audio quality, Applio-only."
@@ -428,7 +432,7 @@ def train_tab():
                         info=i18n(
                             "Specify the number of GPUs you wish to utilize for extracting by entering them separated by hyphens (-)."
                         ),
-                        placeholder=i18n("0 to ∞ separated by -"),
+                        placeholder=i18n("0 to âˆž separated by -"),
                         value=str(get_number_of_gpus()),
                         interactive=True,
                     )
@@ -439,7 +443,7 @@ def train_tab():
                         interactive=False,
                     )
     # Preprocess section
-    with gr.Accordion(i18n("Preprocess")):
+    with step_card(2, "Prepare Dataset", i18n, description="Point to your dataset, clean it and preprocess audio slices."):
         dataset_path = gr.Dropdown(
             label=i18n("Dataset Path"),
             info=i18n("Path to the dataset folder."),
@@ -470,7 +474,8 @@ def train_tab():
         refresh = gr.Button(i18n("Refresh models and datasets"))
 
         with gr.Accordion(i18n("Advanced Settings"), open=False):
-            cut_preprocess = gr.Radio(
+            cut_preprocess = gr.Dropdown(
+                filterable=False,
                 label=i18n("Audio cutting"),
                 info=i18n(
                     "Audio file slicing method: Select 'Skip' if the files are already pre-sliced, 'Simple' if excessive silence has already been removed from the files, or 'Automatic' for automatic silence detection and slicing around it."
@@ -512,7 +517,8 @@ def train_tab():
                     visible=True,
                 )
 
-                normalization_mode = gr.Radio(
+                normalization_mode = gr.Dropdown(
+                    filterable=False,
                     label=i18n("Normalization mode"),
                     info=i18n(
                         "Audio normalization: Select 'none' if the files are already normalized, 'pre' to normalize the entire input file at once, or 'post' to normalize each slice individually."
@@ -532,7 +538,7 @@ def train_tab():
         )
 
         with gr.Row():
-            preprocess_button = gr.Button(i18n("Preprocess Dataset"))
+            preprocess_button = gr.Button(i18n("Preprocess Dataset"), variant="primary")
             preprocess_button.click(
                 fn=_preprocess_with_toast,
                 inputs=[
@@ -550,9 +556,10 @@ def train_tab():
             )
 
     # Extract section
-    with gr.Accordion(i18n("Extract")):
+    with step_card(3, "Extract Features", i18n, description="Extract pitch and embeddings used for training."):
         with gr.Row():
-            f0_method = gr.Radio(
+            f0_method = gr.Dropdown(
+                filterable=False,
                 label=i18n("Pitch extraction algorithm"),
                 info=i18n(
                     "Pitch extraction algorithm to use for the audio conversion. The default algorithm is rmvpe, which is recommended for most cases."
@@ -566,7 +573,8 @@ def train_tab():
                 interactive=True,
             )
 
-            embedder_model = gr.Radio(
+            embedder_model = gr.Dropdown(
+                filterable=False,
                 label=i18n("Embedder Model"),
                 info=i18n("Model used for learning speaker embedding."),
                 choices=[
@@ -624,7 +632,7 @@ def train_tab():
             max_lines=8,
             interactive=False,
         )
-        extract_button = gr.Button(i18n("Extract Features"))
+        extract_button = gr.Button(i18n("Extract Features"), variant="primary")
         extract_button.click(
             fn=_extract_with_toast,
             inputs=[
@@ -641,7 +649,7 @@ def train_tab():
         )
 
     # Training section
-    with gr.Accordion(i18n("Training")):
+    with step_card(4, "Train Model", i18n, description="Configure epochs and batch size, then start training."):
         with gr.Row():
             batch_size = gr.Slider(
                 1,
@@ -773,7 +781,8 @@ def train_tab():
                             allow_custom_value=True,
                         )
 
-            index_algorithm = gr.Radio(
+            index_algorithm = gr.Dropdown(
+                filterable=False,
                 label=i18n("Index Algorithm"),
                 info=i18n(
                     "KMeans is a clustering algorithm that divides the dataset into K clusters. This setting is particularly useful for large datasets."
@@ -808,7 +817,7 @@ def train_tab():
         )
 
         with gr.Row():
-            train_button = gr.Button(i18n("Start Training"))
+            train_button = gr.Button(i18n("Start Training"), variant="primary")
 
             stop_train_button = gr.Button(i18n("Stop Training"), visible=False)
             stop_train_button.click(
@@ -825,7 +834,7 @@ def train_tab():
             )
 
     # Export Model section
-    with gr.Accordion(i18n("Export Model"), open=False):
+    with step_card(5, "Export Model", i18n, description="Select trained files to export or upload."):
         if os.getenv("COLAB_RELEASE_TAG"):
             gr.Markdown(
                 i18n(

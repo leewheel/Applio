@@ -54,7 +54,7 @@ def apply_config_update(instance, current, message):
         "volume_envelope": (0, 1),
         "autotune_strength": (0, 1),
         "formant_qfrency": (0, 32),
-        "formant_timbre": (0, 32),
+        "formant_timbre": (0.1, 32),
         "input_audio_gain": (0, 200),
         "silent_threshold": (-90, 0),
         "cross_fade_overlap_size": (0.01, 0.5),
@@ -107,7 +107,7 @@ def apply_config_update(instance, current, message):
     if embedder != model.embedder_model or custom != model.embedder_model_custom:
         hubert = load_embedding(embedder, custom)
         strip_parametrizations(hubert)
-        hubert = hubert.to(instance.device).float().eval()
+        hubert = hubert.float().to(instance.device).eval()
     index, data = pipeline.index, pipeline.big_tsr
     retrieval_enabled = candidate.get("index_rate", 0) > 0
     if not index_path:

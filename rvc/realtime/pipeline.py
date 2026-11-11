@@ -24,6 +24,7 @@ from rvc.lib.algorithm.synthesizers import Synthesizer
 from rvc.lib.predictors.f0 import FCPE, RMVPE, SWIFT
 from rvc.lib.utils import load_embedding, HubertModelWithFinalProj
 from rvc.realtime.precision import enable_experimental_tf32
+from rvc.infer.wrapper import ONNXRVC
 
 
 class RealtimeVoiceConverter:
@@ -69,6 +70,8 @@ class RealtimeVoiceConverter:
             self.model_checksum = checkpoint_hash(weight_root)
         self.cpt = (
             torch.load(weight_root, map_location="cpu", weights_only=True)
+            if weight_root.endswith(".pth")
+            else ONNXRVC(weight_root, device=self.config.device, capture=False)
             if os.path.isfile(weight_root)
             else None
         )
@@ -83,6 +86,15 @@ class RealtimeVoiceConverter:
         Sets up the network configuration based on the loaded checkpoint.
         """
         if self.cpt is not None:
+            if isinstance(self.cpt, ONNXRVC):
+                self.net_g = self.cpt
+                self.tgt_sr = self.cpt.tgt_sr
+                self.use_f0 = self.cpt.use_f0
+                self.version = self.cpt.version
+                self.vocoder = self.cpt.vocoder
+                self.text_enc_hidden_dim = 768 if self.version == "v2" else 256
+                return
+
             self.tgt_sr = self.cpt["config"][-1]
             self.cpt["config"][-3] = self.cpt["weight"]["emb_g.weight"].shape[0]
             self.use_f0 = self.cpt.get("f0", 1)
@@ -99,7 +111,7 @@ class RealtimeVoiceConverter:
 
             self.net_g.load_state_dict(self.cpt["weight"], strict=False)
             strip_parametrizations(self.net_g)
-            self.net_g = self.net_g.to(self.config.device).to(self.dtype)
+            self.net_g = self.net_g.to(self.dtype).to(self.config.device)
             self.net_g.eval()
             # The network owns its weights now; retaining the CPU checkpoint
             # duplicates the model even when inference runs on an accelerator.
@@ -749,7 +761,7 @@ def create_pipeline(
 
     hubert_model = load_embedding(embedder_model, embedder_model_custom)
     strip_parametrizations(hubert_model)
-    hubert_model = hubert_model.to(vc.config.device).to(vc.dtype)
+    hubert_model = hubert_model.to(vc.dtype).to(vc.config.device)
     hubert_model.eval()
 
     pipeline = Realtime_Pipeline(

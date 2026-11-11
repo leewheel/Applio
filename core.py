@@ -58,7 +58,12 @@ python = sys.executable
 
 def run_quiet(command, **kwargs):
     if os.name == "nt":
-        kwargs.setdefault("creationflags", getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        # Keep the parent's console so spawned training/extraction workers can
+        # write to it too. CREATE_NO_WINDOW detaches the process from it.
+        startupinfo = subprocess.STARTUPINFO()
+        startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        startupinfo.wShowWindow = subprocess.SW_HIDE
+        kwargs.setdefault("startupinfo", startupinfo)
     return subprocess.run(command, **kwargs)
 
 
@@ -113,7 +118,6 @@ def _base_infer_kwargs(
     f0_method="rmvpe",
     pth_path="",
     index_path="",
-    split_audio=False,
     f0_autotune=False,
     f0_autotune_strength=1.0,
     proposed_pitch=False,
@@ -127,6 +131,8 @@ def _base_infer_kwargs(
     sid=0,
     inference_engine=None,
     onnx_precision="auto",
+    cleanup_mode="off",
+    cleanup_strength=12,
 ):
     return {
         "model_path": pth_path,
@@ -136,7 +142,6 @@ def _base_infer_kwargs(
         "index_rate": index_rate,
         "protect": protect,
         "f0_method": f0_method,
-        "split_audio": split_audio,
         "f0_autotune": f0_autotune,
         "f0_autotune_strength": f0_autotune_strength,
         "proposed_pitch": proposed_pitch,
@@ -150,6 +155,8 @@ def _base_infer_kwargs(
         "sid": sid,
         "inference_engine": inference_engine,
         "onnx_precision": onnx_precision,
+        "cleanup_mode": cleanup_mode,
+        "cleanup_strength": cleanup_strength,
     }
 
 
@@ -163,7 +170,6 @@ def run_infer_script(
     output_path: str,
     pth_path: str,
     index_path: str,
-    split_audio: bool,
     f0_autotune: bool,
     f0_autotune_strength: float,
     proposed_pitch: bool,
@@ -177,6 +183,8 @@ def run_infer_script(
     sid: int = 0,
     inference_engine: str = None,
     onnx_precision: str = "auto",
+    cleanup_mode: str = "off",
+    cleanup_strength: float = 12,
 ):
     kwargs = _base_infer_kwargs(
         pitch=pitch,
@@ -186,7 +194,6 @@ def run_infer_script(
         f0_method=f0_method,
         pth_path=pth_path,
         index_path=index_path,
-        split_audio=split_audio,
         f0_autotune=f0_autotune,
         f0_autotune_strength=f0_autotune_strength,
         proposed_pitch=proposed_pitch,
@@ -200,6 +207,8 @@ def run_infer_script(
         sid=sid,
         inference_engine=inference_engine,
         onnx_precision=onnx_precision,
+        cleanup_mode=cleanup_mode,
+        cleanup_strength=cleanup_strength,
     )
     kwargs["audio_input_path"] = input_path
     kwargs["audio_output_path"] = output_path
@@ -220,7 +229,6 @@ def run_batch_infer_script(
     output_folder: str,
     pth_path: str,
     index_path: str,
-    split_audio: bool,
     f0_autotune: bool,
     f0_autotune_strength: float,
     proposed_pitch: bool,
@@ -234,6 +242,8 @@ def run_batch_infer_script(
     sid: int = 0,
     inference_engine: str = None,
     onnx_precision: str = "auto",
+    cleanup_mode: str = "off",
+    cleanup_strength: float = 12,
 ):
     kwargs = _base_infer_kwargs(
         pitch=pitch,
@@ -243,7 +253,6 @@ def run_batch_infer_script(
         f0_method=f0_method,
         pth_path=pth_path,
         index_path=index_path,
-        split_audio=split_audio,
         f0_autotune=f0_autotune,
         f0_autotune_strength=f0_autotune_strength,
         proposed_pitch=proposed_pitch,
@@ -257,6 +266,8 @@ def run_batch_infer_script(
         sid=sid,
         inference_engine=inference_engine,
         onnx_precision=onnx_precision,
+        cleanup_mode=cleanup_mode,
+        cleanup_strength=cleanup_strength,
     )
     kwargs["audio_input_paths"] = input_folder
     kwargs["audio_output_path"] = output_folder
@@ -279,7 +290,6 @@ def run_tts_script(
     output_rvc_path: str,
     pth_path: str,
     index_path: str,
-    split_audio: bool,
     f0_autotune: bool,
     f0_autotune_strength: float,
     proposed_pitch: bool,
@@ -291,6 +301,8 @@ def run_tts_script(
     formant_shifting: bool = False,
     formant_qfrency: float = 1.0,
     formant_timbre: float = 1.0,
+    cleanup_mode: str = "off",
+    cleanup_strength: float = 12,
 ):
     tts_script_path = os.path.join(
         current_script_directory, "rvc", "lib", "tools", "tts.py"
@@ -341,7 +353,6 @@ def run_tts_script(
             audio_output_path=output_rvc_path,
             model_path=pth_path,
             index_path=index_path,
-            split_audio=split_audio,
             f0_autotune=f0_autotune,
             f0_autotune_strength=f0_autotune_strength,
             proposed_pitch=proposed_pitch,
@@ -349,6 +360,9 @@ def run_tts_script(
             formant_shifting=formant_shifting,
             formant_qfrency=formant_qfrency,
             formant_timbre=formant_timbre,
+            cleanup_mode=cleanup_mode,
+            cleanup_strength=cleanup_strength,
+            cleanup_stage="output",
             export_format=export_format,
             embedder_model=embedder_model,
             embedder_model_custom=embedder_model_custom,
@@ -358,6 +372,10 @@ def run_tts_script(
             ".wav", f".{export_format.lower()}"
         )
 
+    if cleanup_mode != "off":
+        from rvc.lib.tools.audio_cleanup import cleanup_file
+
+        cleanup_file(output_tts_path, cleanup_mode, cleanup_strength)
     return f"Text synthesized successfully.", output_tts_path
 
 
@@ -597,6 +615,23 @@ def run_model_information_script(pth_path: str):
         )
 
 
+def run_model_onnx_export_script(pth_path: str, output_path: str, is_half: bool = False, device: str = "cpu"):
+    if not os.path.exists(pth_path):
+        raise FileNotFoundError(f"Model file not found: '{pth_path}'")
+    if not output_path:
+        output_path = pth_path.replace(".pth", ".onnx")
+    try:
+        from rvc.lib.tools.onnx_export import onnx_exporter
+
+        info = onnx_exporter(pth_path, output_path, is_half=is_half, device=device)
+        print(info)
+        return info
+    except ImportError as e:
+        raise RuntimeError(
+            f"Missing dependency: {e}. Please install requirements: pip install -r requirements.txt"
+        )
+
+
 def run_model_blender_script(
     model_name: str, pth_path_1: str, pth_path_2: str, ratio: float
 ):
@@ -681,6 +716,18 @@ def _infer_opts(func):
     """Core inference options shared by infer, batch_infer and tts."""
     opts = [
         click.option(
+            "--cleanup-mode",
+            type=click.Choice(["off", "light", "speech"]),
+            default="off",
+            help="Optional file noise reduction. Speech may remove singing.",
+        ),
+        click.option(
+            "--cleanup-strength",
+            type=click.FloatRange(1, 30),
+            default=12,
+            help="Noise reduction limit in dB.",
+        ),
+        click.option(
             "--pitch",
             type=click.IntRange(-24, 24),
             default=0,
@@ -719,12 +766,6 @@ def _infer_opts(func):
             ),
             default="rmvpe",
             help="Choose the pitch extraction algorithm.",
-        ),
-        click.option(
-            "--split-audio",
-            is_flag=True,
-            default=False,
-            help="Split audio into smaller segments before inference.",
         ),
         click.option(
             "--f0-autotune",
@@ -1151,6 +1192,15 @@ def model_information(**kwargs):
     """Display information about a trained model."""
     run_model_information_script(kwargs["pth_path"])
 
+
+@cli.command()
+@click.option("--pth-path", required=True, help="Path to the .pth model file.")
+@click.option("--output-path", help="Path to the .onnx model output file.")
+@click.option("--is-half", default=False, help="Save the model at half the size.")
+@click.option("--device", default="cpu", help="path to the .onnx model output file.")
+def model_onnx_export(**kwargs):
+    """Converting a .pth model to .onnx format"""
+    run_model_onnx_export_script(kwargs["pth_path"], kwargs["output_path"], kwargs["is_half"], kwargs["device"])
 
 @cli.command()
 @click.option("--model-name", required=True, help="Name of the new fused model.")

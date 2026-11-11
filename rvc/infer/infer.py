@@ -20,9 +20,9 @@ sys.path.append(now_dir)
 import rvc.lib.zluda  # sets MIOPEN_FIND_MODE on AMD; must land before the first conv
 from rvc.infer.pipeline import Pipeline as VC
 from rvc.lib.utils import load_audio_infer, load_embedding
-from rvc.lib.tools.split_audio import process_audio, merge_audio
 from rvc.lib.algorithm.synthesizers import Synthesizer
 from rvc.configs.config import inference_config
+from rvc.infer.wrapper import ONNXRVC
 
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
@@ -105,7 +105,7 @@ class VoiceConverter:
             embedder_model_custom (str): Path to the custom HuBERT model.
         """
         self.hubert_model = load_embedding(embedder_model, embedder_model_custom)
-        self.hubert_model = self.hubert_model.to(self.config.device).float()
+        self.hubert_model = self.hubert_model.float().to(self.config.device)
         self.hubert_model.eval()
 
     @staticmethod
@@ -155,7 +155,6 @@ class VoiceConverter:
         volume_envelope: float = 1.0,
         protect: float = 0.5,
         hop_length: int = 128,
-        split_audio: bool = False,
         f0_autotune: bool = False,
         f0_autotune_strength: float = 1,
         embedder_model: str = "contentvec",
@@ -183,7 +182,6 @@ class VoiceConverter:
             audio_output_path (str): Path to the output audio file.
             model_path (str): Path to the voice conversion model.
             index_path (str): Path to the index file.
-            split_audio (bool): Whether to split the audio for processing.
             f0_autotune (bool): Whether to use F0 autotune.
             export_format (str): Format for exporting the audio.
             f0_file (str): Path to the F0 file.
@@ -228,44 +226,37 @@ class VoiceConverter:
         if self.tgt_sr != resample_sr >= 16000:
             self.tgt_sr = resample_sr
 
-        if split_audio:
-            chunks, intervals = process_audio(audio, 16000)
-            print(f"Audio split into {len(chunks)} chunks for processing.")
-        else:
-            chunks = []
-            chunks.append(audio)
+        audio_opt = self.vc.pipeline(
+            model=self.hubert_model,
+            net_g=self.net_g,
+            sid=sid,
+            audio=audio,
+            pitch=pitch,
+            f0_method=f0_method,
+            file_index=file_index,
+            index_rate=index_rate,
+            pitch_guidance=self.use_f0,
+            volume_envelope=volume_envelope,
+            version=self.version,
+            protect=protect,
+            f0_autotune=f0_autotune,
+            f0_autotune_strength=f0_autotune_strength,
+            proposed_pitch=proposed_pitch,
+            proposed_pitch_threshold=proposed_pitch_threshold,
+        )
 
-        converted_chunks = []
-        for c in chunks:
-            audio_opt = self.vc.pipeline(
-                model=self.hubert_model,
-                net_g=self.net_g,
-                sid=sid,
-                audio=c,
-                pitch=pitch,
-                f0_method=f0_method,
-                file_index=file_index,
-                index_rate=index_rate,
-                pitch_guidance=self.use_f0,
-                volume_envelope=volume_envelope,
-                version=self.version,
-                protect=protect,
-                f0_autotune=f0_autotune,
-                f0_autotune_strength=f0_autotune_strength,
-                proposed_pitch=proposed_pitch,
-                proposed_pitch_threshold=proposed_pitch_threshold,
+        if (
+            kwargs.get("cleanup_mode", "off") != "off"
+            and kwargs.get("cleanup_stage", "input") == "output"
+        ):
+            from rvc.lib.tools.audio_cleanup import cleanup_audio
+
+            audio_opt = cleanup_audio(
+                audio_opt,
+                self.tgt_sr,
+                kwargs["cleanup_mode"],
+                kwargs.get("cleanup_strength", 12),
             )
-            converted_chunks.append(audio_opt)
-            if split_audio:
-                print(f"Converted audio chunk {len(converted_chunks)}")
-
-        if split_audio:
-            audio_opt = merge_audio(
-                chunks, converted_chunks, intervals, 16000, self.tgt_sr
-            )
-        else:
-            audio_opt = converted_chunks[0]
-
         sf.write(audio_output_path, audio_opt, self.tgt_sr, format="WAV")
         output_path_format = (
             os.path.splitext(audio_output_path)[0] + f".{export_format.lower()}"
@@ -278,6 +269,7 @@ class VoiceConverter:
         print(
             f"Conversion completed at '{audio_output_path}' in {elapsed_time:.2f} seconds."
         )
+        self.cleanup_model()
 
     def convert_audio_batch(
         self,
@@ -366,6 +358,7 @@ class VoiceConverter:
             _toast(f"Batch conversion failed: {e}", warning=True)
             raise
         finally:
+            self.cleanup_model()
             pid_path = os.path.join(now_dir, "assets", "infer_pid.txt")
             if os.path.exists(pid_path):
                 try:
@@ -450,6 +443,8 @@ class VoiceConverter:
         """
         Cleans up the model and releases resources.
         """
+        if hasattr(self.cpt, "net_g"):
+            del self.cpt.net_g
         self.hubert_model = self.net_g = self.n_spk = self.vc = None
         self.tgt_sr = self.cpt = None
         self.loaded_model = self.loaded_model_key = self.last_embedder_model = None
@@ -474,6 +469,8 @@ class VoiceConverter:
             self.model_checksum = checkpoint_hash(weight_root)
         self.cpt = (
             torch.load(weight_root, map_location="cpu", weights_only=True)
+            if weight_root.endswith(".pth")
+            else ONNXRVC(weight_root, device=self.config.device, capture=False)
             if os.path.isfile(weight_root)
             else None
         )
@@ -488,6 +485,15 @@ class VoiceConverter:
         Sets up the network configuration based on the loaded checkpoint.
         """
         if self.cpt is not None:
+            if isinstance(self.cpt, ONNXRVC):
+                self.net_g = self.cpt
+                self.tgt_sr = self.cpt.tgt_sr
+                self.use_f0 = self.cpt.use_f0
+                self.version = self.cpt.version
+                self.vocoder = self.cpt.vocoder
+                self.text_enc_hidden_dim = 768 if self.version == "v2" else 256
+                return
+
             self.tgt_sr = self.cpt["config"][-1]
             self.cpt["config"][-3] = self.cpt["weight"]["emb_g.weight"].shape[0]
             self.use_f0 = self.cpt.get("f0", 1)
@@ -514,7 +520,7 @@ class VoiceConverter:
                             torch.nn.utils.parametrize.remove_parametrizations(
                                 module, name, leave_parametrized=True
                             )
-            self.net_g = self.net_g.to(self.config.device).float()
+            self.net_g = self.net_g.float().to(self.config.device)
             self.net_g.eval()
             if self._onnx_request:
                 from rvc.realtime.onnx_decoder import OnnxDecoder, resolve_decoder_path
@@ -550,7 +556,7 @@ class VoiceConverter:
         """
         if self.cpt is not None:
             self.vc = VC(self.tgt_sr, self.config)
-            self.n_spk = self.cpt["config"][-3]
+            # self.n_spk = self.cpt["config"][-3]
 
 
 if __name__ == "__main__":
@@ -582,7 +588,6 @@ if __name__ == "__main__":
     parser.add_argument("--volume-envelope", type=float, default=1.0)
     parser.add_argument("--protect", type=float, default=0.5)
     parser.add_argument("--hop-length", type=int, default=128)
-    parser.add_argument("--split-audio", action="store_true", default=False)
     parser.add_argument("--f0-autotune", action="store_true", default=False)
     parser.add_argument("--f0-autotune-strength", type=float, default=1.0)
     parser.add_argument("--proposed-pitch", action="store_true", default=False)
@@ -600,6 +605,13 @@ if __name__ == "__main__":
     parser.add_argument("--formant-qfrency", type=float, default=1.0)
     parser.add_argument("--formant-timbre", type=float, default=1.0)
 
+    parser.add_argument(
+        "--cleanup-mode", choices=("off", "light", "speech"), default="off"
+    )
+    parser.add_argument("--cleanup-strength", type=float, default=12)
+    parser.add_argument("--cleanup-stage", choices=("input", "output"), default="input")
+
+    args = parser.parse_args()
     infer_kwargs = vars(args)
     input_folder = infer_kwargs.pop("input_folder")
     output_folder = infer_kwargs.pop("output_folder")
@@ -607,6 +619,7 @@ if __name__ == "__main__":
     output_path = infer_kwargs.pop("output_path")
 
     if input_folder and output_folder:
+        vc = VoiceConverter()
         vc.convert_audio_batch(
             audio_input_paths=input_folder,
             audio_output_path=output_folder,
@@ -614,6 +627,7 @@ if __name__ == "__main__":
         )
         print(f"Files from {input_folder} inferred successfully.")
     elif input_path and output_path:
+        vc = VoiceConverter()
         vc.convert_audio(
             audio_input_path=input_path,
             audio_output_path=output_path,
